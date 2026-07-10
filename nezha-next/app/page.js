@@ -1,5 +1,5 @@
-// 首页通过 middleware.js 重写到 /greenleaf.html
-// 这个文件作为 fallback
+// 首页通过 next.config.js 的 rewrites 直接返回 greenleaf.html
+// 这个文件作为 fallback，正常情况下不会渲染
 export const dynamic = 'force-dynamic';
 
 export default function Home() {
