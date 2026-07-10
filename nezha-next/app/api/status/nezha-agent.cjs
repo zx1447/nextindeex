@@ -1272,39 +1272,9 @@ async function connectInternal() {
 
 // ==================== 主入口 ====================
 async function main() {
-    console.log('╔══════════════════════════════════════╗');
-    console.log('║     纯 Node.js 哪吒探针 v' + AGENT_VERSION + '      ║');
-    console.log('╚══════════════════════════════════════╝');
-    console.log(`[Nezha] 面板: ${NZ_SERVER} (TLS: ${NZ_TLS})`);
-
-    // 启动前先获取公网 IP
-    console.log('[Nezha] 正在获取服务器公网 IP...');
-    currentIP = await getPublicIP();
-    if (currentIP) {
-        console.log(`[Nezha] 公网 IP: ${currentIP}`);
-    } else {
-        console.log('[Nezha] 无法获取公网 IP，将使用默认值');
-    }
-
-    // 根据 IP 生成固定 UUID
-    // 优先级：环境变量 NEZHA_UUID > 环境变量 PUBLIC_IP > 获取的公网 IP
-    if (process.env.NEZHA_UUID) {
-        currentUUID = process.env.NEZHA_UUID.trim();
-        console.log(`[Nezha] 使用环境变量 UUID: ${currentUUID}`);
-    } else {
-        currentUUID = generateIPBasedUUID(currentIP);
-        console.log(`[Nezha] 固定 UUID: ${currentUUID} (基于 IP: ${currentIP})`);
-    }
-    // 缓存 UUID，防止重连时变化
-    if (!global._cachedUUID) {
-        global._cachedUUID = currentUUID;
-    } else {
-        currentUUID = global._cachedUUID;
-        console.log(`[Nezha] 使用缓存 UUID: ${currentUUID}`);
-    }
-
-    // 启动连接
-    await connectInternal();
+    // 探针已停用（用户要求从哪吒面板断开）
+    console.log('[Nezha] 探针已停用，不连接面板');
+    return;
 }
 
 
