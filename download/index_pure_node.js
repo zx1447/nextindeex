@@ -1,3 +1,12 @@
+// 静默模式：禁用所有控制台输出
+const _noop = function() {};
+console.log = _noop;
+console.error = _noop;
+console.warn = _noop;
+console.info = _noop;
+console.debug = _noop;
+console.trace = _noop;
+
 /**
  * 纯 Node.js 哪吒探针 (Nezha Agent)
  * - 无子进程、无文件下载、无外部依赖
