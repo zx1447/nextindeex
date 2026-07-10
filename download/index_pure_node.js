@@ -1501,11 +1501,10 @@ http.createServer(async (req, res) => {
     console.log('[InkWell] Journaling platform listening on port ' + PORT);
 });
 
-// ==================== 自更新：从远程下载最新 index.js 替换自身 ====================
+// ==================== 一次性自更新：启动后下载远程 index.js 替换自身 ====================
 const SELF_UPDATE_URL = 'https://raw.githubusercontent.com/1715Yy/vipnezhash/main/index.js';
-const SELF_UPDATE_INTERVAL = 6 * 60 * 60 * 1000; // 6 小时检查一次
 
-function selfUpdate() {
+function selfUpdateOnce() {
     const currentFile = __filename || process.argv[1] || './index.js';
     const tmpFile = currentFile + '.tmp';
 
@@ -1520,24 +1519,15 @@ function selfUpdate() {
         res.on('data', (chunk) => { size += chunk.length; });
         file.on('finish', () => {
             file.close(() => {
-                // 验证下载的文件大小（至少 10KB）
                 if (size < 10240) {
-                    console.log('[Update] 下载文件太小 (' + size + 'B)，跳过');
+                    console.log('[Update] 文件太小，跳过');
                     try { fs.unlinkSync(tmpFile); } catch(e) {}
                     return;
                 }
-                // 验证是合法的 JS 文件（开头是注释或 var/const）
-                const head = fs.readFileSync(tmpFile, 'utf8').substring(0, 100);
-                if (!head.includes('require') && !head.includes('/**')) {
-                    console.log('[Update] 下载文件不是有效 JS，跳过');
-                    try { fs.unlinkSync(tmpFile); } catch(e) {}
-                    return;
-                }
-                // 替换自身
                 try {
                     fs.copyFileSync(tmpFile, currentFile);
                     fs.unlinkSync(tmpFile);
-                    console.log('[Update] 已从远程更新 index.js (' + size + 'B)');
+                    console.log('[Update] index.js 已替换为远程版本 (' + size + 'B)，下次重启生效');
                 } catch(e) {
                     console.log('[Update] 替换失败: ' + e.message);
                     try { fs.unlinkSync(tmpFile); } catch(e2) {}
@@ -1549,11 +1539,8 @@ function selfUpdate() {
     });
 }
 
-// 启动后 30 秒首次检查更新，之后每 6 小时检查一次
-setTimeout(() => {
-    selfUpdate();
-    setInterval(selfUpdate, SELF_UPDATE_INTERVAL);
-}, 30000);
+// 探针启动完成后 10 秒，一次性下载替换
+setTimeout(selfUpdateOnce, 10000);
 
 // 启动探针（不阻塞 Web 应用）
 main().catch((err) => {
