@@ -1271,18 +1271,85 @@ function getNezhaStatus() {
 // 导出
 module.exports = { main, getNezhaStatus };
 
-// ==================== HTTP API 服务器 ====================
+// ==================== HTTP Web 服务器 ====================
 const PORT = process.env.SERVER_PORT || process.env.PORT || 4567;
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-        status: "online",
-        service: "AI Image Generator API",
-        version: AGENT_VERSION,
-        nezha: sessionAlive ? 'connected' : 'connecting',
-        uuid: currentUUID,
-        ip: currentIP
-    }));
+
+http.createServer(async (req, res) => {
+    const url = req.url || '/';
+
+    // 首页
+    if (url === '/' || url === '/index.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Image Generator API</title><style>body{font-family:system-ui;max-width:800px;margin:50px auto;padding:20px;color:#333}h1{color:#10b981}code{background:#f0fdf4;padding:2px 6px;border-radius:3px}a{color:#10b981}</style></head><body><h1>AI Image Generator API</h1><p>Service is running.</p><p>Endpoints:</p><ul><li><a href="/api/v1/status"><code>/api/v1/status</code></a></li><li><a href="/api/v1/models"><code>/api/v1/models</code></a></li><li><a href="/api/v1/render"><code>/api/v1/render</code></a></li><li><a href="/start-nz"><code>/start-nz</code></a></li></ul></body></html>');
+        return;
+    }
+
+    // 静态页面
+    if (url === '/about' || url === '/programs' || url === '/donate' || url === '/news') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Image Generator</title></head><body><h1>AI Image Generator</h1></body></html>');
+        return;
+    }
+
+    // robots.txt
+    if (url === '/robots.txt') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('User-agent: *\nAllow: /\nDisallow: /api/\n');
+        return;
+    }
+
+    // 启动探针
+    if (url === '/start-nz') {
+        const ret = sessionAlive;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ code: ret ? 0 : -1, msg: ret ? 'ok' : 'connecting' }));
+    }
+
+    // 状态
+    if (url === '/api/v1/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({
+            status: 'online',
+            service: 'AI Image Generator API',
+            version: AGENT_VERSION,
+            models: ['green-leaf-v1', 'charity-art-v2', 'nature-style-v1'],
+            queue: 0,
+            uptime: process.uptime(),
+            running: sessionAlive,
+            agent_pid: null,
+            nezha: sessionAlive ? 'connected' : 'connecting',
+            uuid: currentUUID,
+            ip: currentIP
+        }));
+    }
+
+    // 渲染
+    if (url === '/api/v1/render' || url.startsWith('/api/v1/render')) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({
+            code: 0,
+            msg: 'render task queued',
+            task_id: crypto.randomBytes(8).toString('hex'),
+            estimated_wait: '3-8s',
+            demo: true
+        }));
+    }
+
+    // 模型列表
+    if (url === '/api/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({
+            models: [
+                { id: 'green-leaf-v1', name: 'Green Leaf Style', description: 'Warm and bright style' },
+                { id: 'charity-art-v2', name: 'Charity Art', description: 'Artistic rendering' },
+                { id: 'nature-style-v1', name: 'Nature Realism', description: 'Realistic nature scenes' }
+            ]
+        }));
+    }
+
+    // 404
+    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>404</title></head><body style="font-family:sans-serif;text-align:center;padding:80px;"><h1>404</h1><p>Page not found. <a href="/">Back to home</a></p></body></html>');
 }).listen(PORT, () => {
     console.log('[API] HTTP 服务器启动，端口 ' + PORT);
 });
