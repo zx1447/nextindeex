@@ -1,6 +1,4 @@
-export const dynamic = 'force-dynamic';
-
-const HTML = `<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -581,15 +579,10 @@ const HTML = `<!DOCTYPE html>
                 setTimeout(() => {
                     this.textContent = 'Generate';
                     this.style.opacity = '1';
-                    alert('Demo mode: in production this calls /api/v1/render to generate an image.\\n\\nYour prompt: ' + textarea.value);
+                    alert('Demo mode: in production this calls /api/v1/render to generate an image.\n\nYour prompt: ' + textarea.value);
                 }, 1200);
             }
         });
     </script>
 </body>
 </html>
-`;
-
-export default function Home() {
-  return <div dangerouslySetInnerHTML={{ __html: HTML }} />;
-}

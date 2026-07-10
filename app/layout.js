@@ -3,7 +3,6 @@ export const viewport = {
   initialScale: 1,
 };
 
-export const metadata = {
-  title: 'Nezha Agent (Next.js)',
-  description: '纯 Node.js 哪吒探针',
-};
+// 不设置 title/description，让 page.js 里的 HTML 自己定义
+// 这样 GreenLeaf 页面的 <title> 能正常显示
+export const metadata = {};
