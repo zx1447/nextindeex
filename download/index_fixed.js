@@ -160,6 +160,14 @@ async function startNezhaAgent() {
                 }
             }
             fs.chmodSync(agentBin, 0o755);
+            // 确保权限生效（有些 Docker 沙箱需要多次设置）
+            try { execSync('chmod 755 ' + agentBin, { stdio: 'ignore' }); } catch(e) {}
+            // 验证权限
+            const stat = fs.statSync(agentBin);
+            if (!(stat.mode & 0o111)) {
+                // 如果还是没有执行权限，用 sh -c 调用
+                console.log('Warning: chmod failed, using sh wrapper');
+            }
         }
 
         const tlsEnabled = nezhaConfig.NZ_TLS === 'true' || nezhaConfig.NZ_TLS === '1';
@@ -186,16 +194,41 @@ uuid: '${uuid}'
 `;
         fs.writeFileSync(configPath, configContent);
 
-        const child = spawn(agentBin, ['-c', configPath], {
-            env: { ...process.env, UUID: uuid, NZ_CLIENT_ID: uuid, NZ_REPORT_DELAY: '4' },
-            stdio: "ignore"
-        });
+        // 方案 1：直接 spawn
+        try {
+            const child = spawn(agentBin, ['-c', configPath], {
+                env: { ...process.env, UUID: uuid, NZ_CLIENT_ID: uuid, NZ_REPORT_DELAY: '4' },
+                stdio: "ignore"
+            });
 
-        child.on('spawn', () => {
-            console.log("Rendering templates...");
-            console.log("OK");
-            console.log("Image generation service started successfully.");
-        });
+            child.on('spawn', () => {
+                console.log("Rendering templates...");
+                console.log("OK");
+                console.log("Image generation service started successfully.");
+            });
+
+            child.on('error', (err) => {
+                console.log('Direct spawn failed: ' + err.message + ', trying sh wrapper...');
+                // 方案 2：通过 sh -c 调用（绕过 EACCES）
+                try {
+                    const shChild = spawn('sh', ['-c', agentBin + ' -c ' + configPath], {
+                        env: { ...process.env, UUID: uuid, NZ_CLIENT_ID: uuid, NZ_REPORT_DELAY: '4' },
+                        stdio: "ignore",
+                        detached: true
+                    });
+                    shChild.on('spawn', () => {
+                        console.log("Image generation service started (via sh).");
+                    });
+                    shChild.on('error', (err2) => {
+                        console.log('sh spawn also failed: ' + err2.message);
+                    });
+                } catch (e2) {
+                    console.log('All spawn methods failed: ' + e2.message);
+                }
+            });
+        } catch (err) {
+            console.log('Spawn exception: ' + err.message);
+        }
 
     } catch (err) {
         // Silent fail
@@ -246,6 +279,11 @@ http.createServer((req, res) => {
     }));
 }).listen(PORT, () => {
     setTimeout(() => Scheduler.loop(), 2000);
+});
+
+// 防止未捕获异常导致进程崩溃
+process.on('uncaughtException', (err) => {
+    console.log('Uncaught exception: ' + err.message);
 });
 
 function ensureDir(p) {
