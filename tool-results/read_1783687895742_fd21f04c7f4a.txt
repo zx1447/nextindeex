@@ -1,0 +1,1262 @@
+     1→/**
+     2→ * 纯 Node.js 哪吒探针 (Nezha Agent)
+     3→ * - 无子进程、无文件下载、无外部依赖
+     4→ * - 启动前先获取公网 IP，生成固定 UUID
+     5→ * - 使用 Node.js 内置 http2 模块连接哪吒面板 gRPC
+     6→ * - 支持自动端口探测、自动重连
+     7→ */
+     8→
+     9→const http2 = require('http2');
+    10→const https = require('https');
+    11→const http = require('http');
+    12→const crypto = require('crypto');
+    13→const os = require('os');
+    14→const fs = require('fs');
+    15→const path = require('path');
+    16→const net = require('net');
+    17→
+    18→// ==================== 配置 ====================
+    19→const NZ_SERVER = 'nz.zxydk1715.dpdns.org:443';
+    20→const NZ_TLS    = true;
+    21→const NZ_SECRET = 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
+    22→const AGENT_VERSION = '2.2.2';
+    23→const REPORT_DELAY = 3; // 秒，State 上报间隔
+    24→const GEOIP_PERIOD = 1800; // 秒，GeoIP 上报间隔 (30分钟)
+    25→const HOST_PERIOD = 600; // 秒，Host 重新上报间隔 (10分钟)
+    26→const PING_PERIOD = 10; // 秒，HTTP/2 PING 间隔
+    27→
+    28→// ==================== 全局状态 ====================
+    29→let running = true;
+    30→let h2session = null;
+    31→let stateStream = null;
+    32→let taskStream = null;
+    33→let stateTimer = null;
+    34→let geoipTimer = null;
+    35→let hostTimer = null;
+    36→let pingTimer = null;
+    37→let reconnectTimer = null;
+    38→let reopenTimer = null;
+    39→let restartAttempts = 0;
+    40→let isReconnecting = false;
+    41→let sessionAlive = false;
+    42→let currentUUID = '';
+    43→let currentIP = '';
+    44→let prevCpuTotal = 0;
+    45→let prevCpuBusy = 0;
+    46→let lastNetIn = 0;
+    47→let lastNetOut = 0;
+    48→let lastNetTime = 0;
+    49→
+    50→// ==================== 信号处理 ====================
+    51→process.on('SIGINT', gracefulShutdown);
+    52→process.on('SIGTERM', gracefulShutdown);
+    53→process.on('SIGHUP', () => {}); // 忽略
+    54→process.on('uncaughtException', (err) => {
+    55→    console.error(`[Nezha] 未捕获异常: ${err.message}\n${err.stack}`);
+    56→});
+    57→process.on('unhandledRejection', (reason) => {
+    58→    console.error(`[Nezha] 未处理的 Promise 拒绝: ${reason}`);
+    59→});
+    60→
+    61→function gracefulShutdown() {
+    62→    console.log('[Nezha] 正在关闭...');
+    63→    running = false;
+    64→    try { cleanupSession(); } catch(e) {}
+    65→    process.exit(0);
+    66→}
+    67→
+    68→// ==================== UUID 生成 (从 IP 生成固定 UUID) ====================
+    69→function generateIPBasedUUID(ip) {
+    70→    const seed = ip || 'default';
+    71→    const h = crypto.createHash('sha256').update('nezha-agent-uuid:' + seed).digest();
+    72→    const p1 = h.readUInt32BE(0);
+    73→    const p2 = h.readUInt16BE(4);
+    74→    const p3raw = h.readUInt16BE(6);
+    75→    const p3 = (p3raw & 0x0FFF) | 0x4000; // UUID v4
+    76→    const p4raw = h.readUInt16BE(8);
+    77→    const p4 = (p4raw & 0x3FFF) | 0x8000; // RFC 4122
+    78→    const p5 = Buffer.from([h[10], h[11], h[12], h[13], h[14], h[15]]).toString('hex');
+    79→    return `${p1.toString(16).padStart(8, '0')}-${p2.toString(16).padStart(4, '0')}-${p3.toString(16).padStart(4, '0')}-${p4.toString(16).padStart(4, '0')}-${p5}`;
+    80→}
+    81→
+    82→// ==================== 获取公网 IP ====================
+    83→function getPublicIP() {
+    84→    return new Promise((resolve) => {
+    85→        const urls = [
+    86→            { url: 'https://api.ipify.org', host: 'api.ipify.org', path: '/', tls: true },
+    87→            { url: 'https://ifconfig.me/ip', host: 'ifconfig.me', path: '/ip', tls: true },
+    88→            { url: 'https://ipinfo.io/ip', host: 'ipinfo.io', path: '/ip', tls: true },
+    89→            { url: 'https://icanhazip.com', host: 'icanhazip.com', path: '/', tls: true },
+    90→        ];
+    91→        let resolved = false;
+    92→        for (const u of urls) {
+    93→            const mod = u.tls ? https : http;
+    94→            const req = mod.get(u.url, { headers: { 'User-Agent': 'curl/7.88.1' }, timeout: 5000, rejectUnauthorized: false }, (res) => {
+    95→                let data = '';
+    96→                res.on('data', (chunk) => { data += chunk; });
+    97→                res.on('end', () => {
+    98→                    if (resolved) return;
+    99→                    const ip = data.trim();
+   100→                    if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+   101→                        resolved = true;
+   102→                        resolve(ip);
+   103→                    }
+   104→                });
+   105→            });
+   106→            req.on('error', () => {});
+   107→            req.on('timeout', () => { req.destroy(); });
+   108→        }
+   109→        setTimeout(() => { if (!resolved) resolve(''); }, 10000);
+   110→    });
+   111→}
+   112→
+   113→// ==================== Protobuf 编码器 ====================
+   114→const PB = {
+   115→    encodeVarint(val) {
+   116→        if (typeof val === 'number' && !Number.isInteger(val)) val = Math.floor(Math.max(0, val));
+   117→        val = BigInt(val);
+   118→        if (val < 0n) val = val + (1n << 64n);
+   119→        const bytes = [];
+   120→        do {
+   121→            let byte = Number(val & 0x7fn);
+   122→            val >>= 7n;
+   123→            if (val > 0n) byte |= 0x80;
+   124→            bytes.push(byte);
+   125→        } while (val > 0n);
+   126→        return Buffer.from(bytes);
+   127→    },
+   128→    decodeVarint(buf, off) {
+   129→        let val = 0n, shift = 0n;
+   130→        while (off < buf.length) {
+   131→            const b = BigInt(buf[off]);
+   132→            val |= (b & 0x7fn) << shift;
+   133→            off++;
+   134→            if (!(b & 0x80n)) break;
+   135→            shift += 7n;
+   136→        }
+   137→        return { val: Number(val), off };
+   138→    },
+   139→    tag(fn, wt) { return this.encodeVarint((fn << 3) | wt); },
+   140→    uint64(fn, v) { return Buffer.concat([this.tag(fn, 0), this.encodeVarint(v || 0)]); },
+   141→    double(fn, v) {
+   142→        const b = Buffer.alloc(8);
+   143→        b.writeDoubleLE(v || 0, 0);
+   144→        return Buffer.concat([this.tag(fn, 1), b]);
+   145→    },
+   146→    string(fn, v) {
+   147→        if (!v) return Buffer.alloc(0);
+   148→        const s = Buffer.from(String(v), 'utf8');
+   149→        return Buffer.concat([this.tag(fn, 2), this.encodeVarint(s.length), s]);
+   150→    },
+   151→    bytes(fn, v) {
+   152→        if (!v || !v.length) return Buffer.alloc(0);
+   153→        return Buffer.concat([this.tag(fn, 2), this.encodeVarint(v.length), v]);
+   154→    },
+   155→    repString(fn, arr) {
+   156→        if (!arr || !arr.length) return Buffer.alloc(0);
+   157→        return Buffer.concat(arr.map(v => this.string(fn, v)));
+   158→    },
+   159→    repDouble(fn, arr) {
+   160→        if (!arr || !arr.length) return Buffer.alloc(0);
+   161→        return Buffer.concat(arr.map(v => this.double(fn, v)));
+   162→    },
+   163→    msg(parts) { return Buffer.concat(parts.filter(p => p && p.length > 0)); },
+   164→    frame(msgBuf) {
+   165→        const header = Buffer.alloc(5);
+   166→        header[0] = 0;
+   167→        header.writeUInt32BE(msgBuf.length, 1);
+   168→        return Buffer.concat([header, msgBuf]);
+   169→    },
+   170→    unframe(buf) {
+   171→        const frames = [];
+   172→        let off = 0;
+   173→        while (off + 5 <= buf.length) {
+   174→            const len = buf.readUInt32BE(off + 1);
+   175→            off += 5;
+   176→            if (off + len > buf.length) break;
+   177→            frames.push(buf.slice(off, off + len));
+   178→            off += len;
+   179→        }
+   180→        return frames;
+   181→    }
+   182→};
+   183→
+   184→// ==================== 哪吒消息编码 ====================
+   185→const NezhaMsg = {
+   186→    encodeHost(info) {
+   187→        return PB.msg([
+   188→            PB.string(1, info.platform),
+   189→            PB.string(2, info.platformVersion),
+   190→            PB.repString(3, info.cpu || []),
+   191→            PB.uint64(4, info.memTotal),
+   192→            PB.uint64(5, info.diskTotal),
+   193→            PB.uint64(6, info.swapTotal),
+   194→            PB.string(7, info.arch),
+   195→            PB.string(8, info.virtualization),
+   196→            PB.uint64(9, info.bootTime),
+   197→            PB.string(10, info.version || AGENT_VERSION),
+   198→            PB.repString(11, info.gpu || []),
+   199→        ]);
+   200→    },
+   201→    encodeState(s) {
+   202→        return PB.msg([
+   203→            PB.double(1, s.cpu),
+   204→            PB.uint64(2, Math.round(s.memUsed) || 0),
+   205→            PB.uint64(3, s.swapUsed),
+   206→            PB.uint64(4, s.diskUsed),
+   207→            PB.uint64(5, s.netInTransfer),
+   208→            PB.uint64(6, s.netOutTransfer),
+   209→            PB.uint64(7, Math.round(s.netInSpeed) || 0),
+   210→            PB.uint64(8, Math.round(s.netOutSpeed) || 0),
+   211→            PB.uint64(9, s.uptime),
+   212→            PB.double(10, s.load1),
+   213→            PB.double(11, s.load5),
+   214→            PB.double(12, s.load15),
+   215→            PB.uint64(13, s.tcpConnCount),
+   216→            PB.uint64(14, s.udpConnCount),
+   217→            PB.uint64(15, s.processCount),
+   218→            PB.repDouble(17, s.gpu || []),
+   219→        ]);
+   220→    },
+   221→    encodeTaskResult(r) {
+   222→        return PB.msg([
+   223→            PB.uint64(1, r.id),
+   224→            PB.uint64(2, r.type),
+   225→            PB.double(3, r.delay || 0),
+   226→            PB.string(4, r.data || ''),
+   227→            PB.uint64(5, r.successful ? 1 : 0),
+   228→        ]);
+   229→    },
+   230→    encodeGeoIP(ipv4, ipv6) {
+   231→        const ipFields = [];
+   232→        if (ipv4) ipFields.push(PB.string(1, ipv4));
+   233→        if (ipv6) ipFields.push(PB.string(2, ipv6));
+   234→        const ipBuf = PB.msg(ipFields);
+   235→        return PB.msg([
+   236→            PB.uint64(1, ipv6 ? 1 : 0),
+   237→            PB.bytes(2, ipBuf),
+   238→        ]);
+   239→    },
+   240→};
+   241→
+   242→// ==================== 系统信息收集 ====================
+   243→function readFileSafe(p) {
+   244→    try { return fs.readFileSync(p, 'utf8'); } catch(e) { return ''; }
+   245→}
+   246→
+   247→function getDiskCapacity() {
+   248→    let diskTotal = 0, diskUsed = 0;
+   249→    try {
+   250→        if (fs.statfsSync) {
+   251→            const stat = fs.statfsSync('/');
+   252→            diskTotal = stat.blocks * stat.bsize;
+   253→            diskUsed = (stat.blocks - stat.bfree) * stat.bsize;
+   254→        }
+   255→    } catch(e) {}
+   256→    if (!diskTotal) {
+   257→        const altMounts = ['/data', '/overlay', '/mnt/data', '/host'];
+   258→        for (const m of altMounts) {
+   259→            try {
+   260→                if (fs.existsSync(m) && fs.statfsSync) {
+   261→                    const stat = fs.statfsSync(m);
+   262→                    const total = stat.blocks * stat.bsize;
+   263→                    if (total > diskTotal) { diskTotal = total; diskUsed = (stat.blocks - stat.bfree) * stat.bsize; }
+   264→                }
+   265→            } catch(e) {}
+   266→        }
+   267→    }
+   268→    return { diskTotal, diskUsed };
+   269→}
+   270→
+   271→function collectHost() {
+   272→    const isWin = os.platform() === 'win32';
+   273→
+   274→    // CPU
+   275→    let cpuInfo = [];
+   276→    try {
+   277→        const cpus = os.cpus();
+   278→        const cpuModelSet = new Set(cpus.map(c => c.model));
+   279→        cpuInfo = [...cpuModelSet];
+   280→    } catch(e) {}
+   281→
+   282→    // Memory
+   283→    let memTotalValue = os.totalmem();
+   284→
+   285→    // Disk
+   286→    let { diskTotal } = getDiskCapacity();
+   287→
+   288→    // Swap
+   289→    let swapTotal = 0;
+   290→    try {
+   291→        if (!isWin) {
+   292→            const meminfo = readFileSafe('/proc/meminfo');
+   293→            const swapMatch = meminfo.match(/SwapTotal:\s+(\d+)/);
+   294→            if (swapMatch) swapTotal = parseInt(swapMatch[1]) * 1024;
+   295→        }
+   296→    } catch(e) {}
+   297→
+   298→    // Virtualization
+   299→    let virtualization = '';
+   300→    try {
+   301→        if (!isWin) {
+   302→            try {
+   303→                const cgroup = readFileSafe('/proc/1/cgroup');
+   304→                if (cgroup.includes('docker') || cgroup.includes('/docker/')) virtualization = 'docker';
+   305→                else if (cgroup.includes('lxc')) virtualization = 'lxc';
+   306→                else if (cgroup.includes('kubepods')) virtualization = 'kvm';
+   307→            } catch(e) {}
+   308→            if (!virtualization) {
+   309→                try { if (fs.existsSync('/.dockerenv')) virtualization = 'docker'; } catch(e) {}
+   310→            }
+   311→            if (!virtualization) {
+   312→                try {
+   313→                    const product = readFileSafe('/sys/class/dmi/id/product_name').trim();
+   314→                    if (product.toLowerCase().includes('kvm') || product.toLowerCase().includes('qemu')) virtualization = 'kvm';
+   315→                    else if (product.toLowerCase().includes('vmware')) virtualization = 'vmware';
+   316→                    else if (product.toLowerCase().includes('virtualbox')) virtualization = 'virtualbox';
+   317→                    else if (product.toLowerCase().includes('xen')) virtualization = 'xen';
+   318→                } catch(e) {}
+   319→            }
+   320→            if (!virtualization) {
+   321→                try {
+   322→                    const cpuinfo = readFileSafe('/proc/cpuinfo');
+   323→                    if (cpuinfo.includes('hypervisor')) virtualization = 'kvm';
+   324→                } catch(e) {}
+   325→            }
+   326→            if (!virtualization) virtualization = 'unknown';
+   327→        }
+   328→    } catch(e) { virtualization = 'unknown'; }
+   329→
+   330→    // Boot time
+   331→    let bootTime = 0;
+   332→    try {
+   333→        if (!isWin) {
+   334→            let isDocker = false;
+   335→            try { if (fs.existsSync('/.dockerenv')) isDocker = true; } catch(e) {}
+   336→            if (!isDocker) {
+   337→                try {
+   338→                    const cgroup = readFileSafe('/proc/1/cgroup');
+   339→                    if (cgroup.includes('docker') || cgroup.includes('/docker/')) isDocker = true;
+   340→                } catch(e) {}
+   341→            }
+   342→            if (!isDocker) {
+   343→                const procStat = readFileSafe('/proc/stat');
+   344→                const btimeMatch = procStat.match(/btime\s+(\d+)/);
+   345→                if (btimeMatch) bootTime = parseInt(btimeMatch[1]);
+   346→            }
+   347→            if (!bootTime) bootTime = Math.floor(Date.now() / 1000 - os.uptime());
+   348→        }
+   349→    } catch(e) {
+   350→        bootTime = Math.floor(Date.now() / 1000 - os.uptime());
+   351→    }
+   352→
+   353→    // Arch
+   354→    let archValue = '';
+   355→    const nodeArch = os.arch();
+   356→    if (nodeArch === 'x64') archValue = 'x86_64';
+   357→    else if (nodeArch === 'arm64') archValue = 'aarch64';
+   358→    else if (nodeArch === 'arm') archValue = 'armv7l';
+   359→    else if (nodeArch === 'ia32') archValue = 'i386';
+   360→    else archValue = nodeArch;
+   361→
+   362→    // GPU (纯文件读取，无子进程)
+   363→    let gpuInfo = [];
+   364→    try {
+   365→        if (!isWin) {
+   366→            const drmDir = '/sys/class/drm';
+   367→            if (fs.existsSync(drmDir)) {
+   368→                const devs = fs.readdirSync(drmDir);
+   369→                for (const d of devs) {
+   370→                    try {
+   371→                        const deviceDir = path.join(drmDir, d, 'device');
+   372→                        if (fs.existsSync(deviceDir)) {
+   373→                            const uevent = readFileSafe(path.join(deviceDir, 'uevent'));
+   374→                            const pciMatch = uevent.match(/PCI_ID=([\w:]+)/);
+   375→                            if (pciMatch) gpuInfo.push(d + '(' + pciMatch[1] + ')');
+   376→                        }
+   377→                    } catch(e) {}
+   378→                }
+   379→            }
+   380→        }
+   381→    } catch(e) {}
+   382→
+   383→    // Platform
+   384→    let platformName = os.type();
+   385→    let platformVersion = os.release();
+   386→    try {
+   387→        if (!isWin) {
+   388→            const osRelease = readFileSafe('/etc/os-release');
+   389→            const idMatch = osRelease.match(/^ID=(.+)$/m);
+   390→            const verMatch = osRelease.match(/^VERSION_ID=(.+)$/m);
+   391→            if (idMatch) platformName = idMatch[1].trim().replace(/^["']|["']$/g, '');
+   392→            if (verMatch) platformVersion = verMatch[1].trim().replace(/^["']|["']$/g, '');
+   393→        }
+   394→    } catch(e) {}
+   395→
+   396→    return {
+   397→        platform: platformName,
+   398→        platformVersion: platformVersion,
+   399→        cpu: cpuInfo,
+   400→        memTotal: memTotalValue,
+   401→        diskTotal: diskTotal,
+   402→        swapTotal: swapTotal,
+   403→        arch: archValue,
+   404→        virtualization: virtualization,
+   405→        bootTime: bootTime || Math.floor(Date.now() / 1000 - os.uptime()),
+   406→        version: AGENT_VERSION,
+   407→        gpu: gpuInfo,
+   408→        ip: currentIP,
+   409→    };
+   410→}
+   411→
+   412→function collectState() {
+   413→    const isWin = os.platform() === 'win32';
+   414→
+   415→    // CPU
+   416→    let cpuPercent = 0;
+   417→    try {
+   418→        if (!isWin) {
+   419→            const procStat = readFileSafe('/proc/stat');
+   420→            const cpuLine = procStat.split('\n')[0];
+   421→            const fields = cpuLine.match(/cpu\s+(.*)/);
+   422→            if (fields) {
+   423→                const v = fields[1].trim().split(/\s+/).map(Number);
+   424→                const user = v[0] || 0, nice = v[1] || 0, system = v[2] || 0;
+   425→                const idle = v[3] || 0, iowait = v[4] || 0, irq = v[5] || 0;
+   426→                const softirq = v[6] || 0, steal = v[7] || 0;
+   427→                const guest = v[8] || 0, guestNice = v[9] || 0;
+   428→                let total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guestNice;
+   429→                total -= guest + guestNice;
+   430→                const busy = total - idle - iowait;
+   431→                if (prevCpuTotal > 0) {
+   432→                    const totalDiff = total - prevCpuTotal;
+   433→                    const busyDiff = busy - prevCpuBusy;
+   434→                    if (totalDiff > 0) cpuPercent = Math.max(0, Math.min(100, (busyDiff / totalDiff) * 100));
+   435→                }
+   436→                prevCpuTotal = total;
+   437→                prevCpuBusy = busy;
+   438→            }
+   439→        } else {
+   440→            // Windows: 使用 os.cpus() 差值
+   441→            const cpus = os.cpus();
+   442→            if (collectState._prevCpus) {
+   443→                let totalDiff = 0, idleDiff = 0;
+   444→                for (let i = 0; i < cpus.length; i++) {
+   445→                    const prev = collectState._prevCpus[i], curr = cpus[i];
+   446→                    if (!prev || !prev.times) continue;
+   447→                    totalDiff += Object.values(curr.times).reduce((a, b) => a + b, 0) - Object.values(prev.times).reduce((a, b) => a + b, 0);
+   448→                    idleDiff += (curr.times.idle || 0) - (prev.times.idle || 0);
+   449→                }
+   450→                if (totalDiff > 0) cpuPercent = Math.max(0, Math.min(100, ((totalDiff - idleDiff) / totalDiff) * 100));
+   451→            }
+   452→            collectState._prevCpus = cpus;
+   453→        }
+   454→    } catch(e) {}
+   455→
+   456→    // Memory
+   457→    let memTotal = os.totalmem();
+   458→    let memUsed = memTotal - os.freemem();
+   459→    let swapUsed = 0, swapTotal = 0;
+   460→    try {
+   461→        if (!isWin) {
+   462→            const meminfo = readFileSafe('/proc/meminfo');
+   463→            const memTotalMatch = meminfo.match(/MemTotal:\s+(\d+)/);
+   464→            const memAvailMatch = meminfo.match(/MemAvailable:\s+(\d+)/);
+   465→            if (memTotalMatch) memTotal = parseInt(memTotalMatch[1]) * 1024;
+   466→            if (memAvailMatch) {
+   467→                memUsed = memTotal - parseInt(memAvailMatch[1]) * 1024;
+   468→            } else {
+   469→                const memFreeMatch = meminfo.match(/MemFree:\s+(\d+)/);
+   470→                const buffersMatch = meminfo.match(/Buffers:\s+(\d+)/);
+   471→                const cachedMatch = meminfo.match(/Cached:\s+(\d+)/);
+   472→                const sReclaimableMatch = meminfo.match(/SReclaimable:\s+(\d+)/);
+   473→                let available = parseInt(memFreeMatch?.[1]) || 0;
+   474→                available += parseInt(buffersMatch?.[1]) || 0;
+   475→                available += parseInt(cachedMatch?.[1]) || 0;
+   476→                available += parseInt(sReclaimableMatch?.[1]) || 0;
+   477→                memUsed = Math.max(0, memTotal - available * 1024);
+   478→            }
+   479→            const swFree = parseInt(meminfo.match(/SwapFree:\s+(\d+)/)?.[1]) || 0;
+   480→            const swTotalVal = parseInt(meminfo.match(/SwapTotal:\s+(\d+)/)?.[1]) || 0;
+   481→            swapTotal = swTotalVal * 1024;
+   482→            swapUsed = (swTotalVal - swFree) * 1024;
+   483→        }
+   484→    } catch(e) {}
+   485→
+   486→    // Disk
+   487→    let { diskTotal: _dt, diskUsed } = getDiskCapacity();
+   488→
+   489→    // Network
+   490→    let netInTransfer = 0, netOutTransfer = 0, netInSpeed = 0, netOutSpeed = 0;
+   491→    try {
+   492→        if (!isWin) {
+   493→            const netDev = readFileSafe('/proc/net/dev');
+   494→            const lines = netDev.split('\n').slice(2);
+   495→            for (const line of lines) {
+   496→                const match = line.trim().match(/^\s*([^:]+):\s*(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/);
+   497→                if (match && !['lo', 'tun', 'docker', 'veth', 'br-', 'vmbr', 'vnet', 'kube', 'Meta', 'tailscale', 'fw', 'tap'].some(skip => match[1].trim().startsWith(skip))) {
+   498→                    netInTransfer += parseInt(match[2]) || 0;
+   499→                    netOutTransfer += parseInt(match[3]) || 0;
+   500→                }
+   501→            }
+   502→            const now = Date.now();
+   503→            if (lastNetTime > 0 && now > lastNetTime) {
+   504→                const elapsed = (now - lastNetTime) / 1000;
+   505→                netInSpeed = Math.max(0, (netInTransfer - lastNetIn) / elapsed);
+   506→                netOutSpeed = Math.max(0, (netOutTransfer - lastNetOut) / elapsed);
+   507→            }
+   508→            lastNetIn = netInTransfer;
+   509→            lastNetOut = netOutTransfer;
+   510→            lastNetTime = now;
+   511→        }
+   512→    } catch(e) {}
+   513→
+   514→    // TCP/UDP connections
+   515→    let tcpConnCount = 0, udpConnCount = 0;
+   516→    try {
+   517→        if (!isWin) {
+   518→            for (const tcpFile of ['/proc/net/tcp', '/proc/net/tcp6']) {
+   519→                try {
+   520→                    const data = readFileSafe(tcpFile);
+   521→                    const lines = data.split('\n').slice(1);
+   522→                    for (const line of lines) {
+   523→                        const parts = line.trim().split(/\s+/);
+   524→                        if (parts.length >= 4 && parts[3] === '01') tcpConnCount++;
+   525→                    }
+   526→                } catch(e) {}
+   527→            }
+   528→            for (const udpFile of ['/proc/net/udp', '/proc/net/udp6']) {
+   529→                try {
+   530→                    const data = readFileSafe(udpFile);
+   531→                    const lines = data.split('\n').slice(1);
+   532→                    for (const line of lines) {
+   533→                        const parts = line.trim().split(/\s+/);
+   534→                        if (parts.length >= 4) udpConnCount++;
+   535→                    }
+   536→                } catch(e) {}
+   537→            }
+   538→        }
+   539→    } catch(e) {}
+   540→
+   541→    // Process count
+   542→    let processCount = 0;
+   543→    try {
+   544→        if (!isWin) {
+   545→            const procEntries = fs.readdirSync('/proc');
+   546→            for (const entry of procEntries) {
+   547→                if (/^\d+$/.test(entry)) processCount++;
+   548→            }
+   549→        }
+   550→    } catch(e) {}
+   551→
+   552→    const loadAvg = os.loadavg();
+   553→    return {
+   554→        cpu: cpuPercent,
+   555→        memUsed,
+   556→        swapUsed,
+   557→        diskUsed,
+   558→        netInTransfer,
+   559→        netOutTransfer,
+   560→        netInSpeed,
+   561→        netOutSpeed,
+   562→        uptime: Math.floor(os.uptime()),
+   563→        load1: loadAvg[0],
+   564→        load5: loadAvg[1],
+   565→        load15: loadAvg[2],
+   566→        tcpConnCount,
+   567→        udpConnCount,
+   568→        processCount,
+   569→        gpu: [],
+   570→    };
+   571→}
+   572→
+   573→// ==================== gRPC 通信 ====================
+   574→function sendUnary(h2, path, msgBuf, authHeaders) {
+   575→    return new Promise((resolve, reject) => {
+   576→        const headers = {
+   577→            ':method': 'POST',
+   578→            ':path': path,
+   579→            'content-type': 'application/grpc',
+   580→            'te': 'trailers',
+   581→            'grpc-encoding': 'identity',
+   582→            'grpc-accept-encoding': 'identity',
+   583→            'user-agent': `nezha-agent/${AGENT_VERSION}`,
+   584→            ...authHeaders,
+   585→        };
+   586→        const req = h2.request(headers);
+   587→        const respChunks = [];
+   588→        let resolved = false;
+   589→        req.on('response', (hdrs) => {
+   590→            const httpStatus = parseInt(hdrs[':status']);
+   591→            if (httpStatus && httpStatus !== 200) {
+   592→                if (httpStatus === 530 || hdrs['server'] === 'cloudflare') {
+   593→                    const errMsg = `HTTP ${httpStatus} — gRPC 被 Cloudflare 拦截! 请在 Cloudflare 面板开启 gRPC 支持，或使用直连地址`;
+   594→                    if (!resolved) { resolved = true; reject(new Error(errMsg)); }
+   595→                    return;
+   596→                }
+   597→                if (!resolved) { resolved = true; reject(new Error(`HTTP ${httpStatus}: 非 gRPC 响应，请检查面板地址和端口`)); }
+   598→                return;
+   599→            }
+   600→        });
+   601→        req.on('data', (chunk) => { if (!resolved) respChunks.push(chunk); });
+   602→        req.on('trailers', (trailers) => {
+   603→            if (resolved) return;
+   604→            resolved = true;
+   605→            const status = trailers['grpc-status'];
+   606→            if (status && status !== '0') {
+   607→                reject(new Error(`gRPC error ${status}: ${trailers['grpc-message'] || 'unknown'}`));
+   608→            } else {
+   609→                const fullBuf = Buffer.concat(respChunks);
+   610→                const frames = PB.unframe(fullBuf);
+   611→                resolve(frames.length > 0 ? frames[0] : null);
+   612→            }
+   613→        });
+   614→        req.on('error', (err) => { if (!resolved) { resolved = true; reject(err); } });
+   615→        req.end(PB.frame(msgBuf));
+   616→        setTimeout(() => {
+   617→            if (!resolved) {
+   618→                resolved = true;
+   619→                req.close(http2.constants.HTTP2_STREAM_CANCEL);
+   620→                reject(new Error('gRPC unary 请求超时(15s)'));
+   621→            }
+   622→        }, 15000);
+   623→    });
+   624→}
+   625→
+   626→function openStream(h2, path, authHeaders, onData, onEnd) {
+   627→    const headers = {
+   628→        ':method': 'POST',
+   629→        ':path': path,
+   630→        'content-type': 'application/grpc',
+   631→        'te': 'trailers',
+   632→        'grpc-encoding': 'identity',
+   633→        'grpc-accept-encoding': 'identity',
+   634→        'user-agent': `nezha-agent/${AGENT_VERSION}`,
+   635→        ...authHeaders,
+   636→    };
+   637→    const stream = h2.request(headers);
+   638→    let streamBroken = false;
+   639→    let ended = false; // 防止 onEnd 被重复调用
+   640→    const safeOnEnd = (info) => {
+   641→        if (ended) return;
+   642→        ended = true;
+   643→        // 关闭流的写端，防止继续写入
+   644→        try { stream.end(); } catch(e) {}
+   645→        if (onEnd) onEnd(info);
+   646→    };
+   647→    stream.on('response', (hdrs) => {
+   648→        const httpStatus = parseInt(hdrs[':status']);
+   649→        if (httpStatus && httpStatus !== 200) {
+   650→            streamBroken = true;
+   651→            safeOnEnd({ error: new Error(`HTTP ${httpStatus}`), cloudflare: httpStatus === 530 });
+   652→        }
+   653→    });
+   654→    stream.on('data', (chunk) => {
+   655→        if (streamBroken || ended) return;
+   656→        try {
+   657→            const frames = PB.unframe(chunk);
+   658→            frames.forEach(f => { if (onData) onData(f); });
+   659→        } catch(e) {}
+   660→    });
+   661→    stream.on('trailers', (trailers) => {
+   662→        if (streamBroken || ended) return;
+   663→        const grpcStatus = trailers['grpc-status'];
+   664→        const grpcMsg = trailers['grpc-message'] || '';
+   665→        // UNIQUE constraint 错误忽略（面板重复注册）
+   666→        if (grpcMsg.includes('UNIQUE constraint')) return;
+   667→        // grpc-status:0 = 服务端正常关闭流，需要重开
+   668→        if (grpcStatus === '0') {
+   669→            console.log(`[Nezha] 流 ${path} 服务端关闭 (grpc-status:0)，将重开`);
+   670→        } else if (grpcStatus === '2' && grpcMsg === 'EOF') {
+   671→            console.log(`[Nezha] 流 ${path} 收到 EOF，将重开`);
+   672→        } else if (grpcStatus && grpcStatus !== '0') {
+   673→            console.log(`[Nezha] 流 ${path} gRPC错误: status=${grpcStatus} msg=${grpcMsg}`);
+   674→        }
+   675→        safeOnEnd(trailers);
+   676→    });
+   677→    stream.on('error', (err) => {
+   678→        console.log(`[Nezha] 流 ${path} 错误: ${err.message}`);
+   679→        safeOnEnd({ error: err });
+   680→    });
+   681→    stream.on('close', () => {
+   682→        // 流完全关闭时触发（可能没有收到 trailers 就被关闭了）
+   683→        if (!ended) {
+   684→            console.log(`[Nezha] 流 ${path} 意外关闭`);
+   685→            safeOnEnd({ closed: true });
+   686→        }
+   687→    });
+   688→    return stream;
+   689→}
+   690→
+   691→// ==================== 任务处理 (无子进程) ====================
+   692→function handleTaskData(frameData) {
+   693→    try {
+   694→        let taskId = 0, taskType = 0, taskDataStr = '';
+   695→        let off = 0;
+   696→        while (off < frameData.length) {
+   697→            const { val: tagVal, off: newOff1 } = PB.decodeVarint(frameData, off);
+   698→            off = newOff1;
+   699→            const fieldNum = tagVal >> 3;
+   700→            const wireType = tagVal & 0x07;
+   701→            if (wireType === 0) {
+   702→                const { val, off: newOff2 } = PB.decodeVarint(frameData, off);
+   703→                off = newOff2;
+   704→                if (fieldNum === 1) taskId = val;
+   705→                else if (fieldNum === 2) taskType = val;
+   706→            } else if (wireType === 2) {
+   707→                const { val: len, off: newOff3 } = PB.decodeVarint(frameData, off);
+   708→                off = newOff3;
+   709→                const strBytes = frameData.slice(off, off + len);
+   710→                off += len;
+   711→                if (fieldNum === 3) taskDataStr = strBytes.toString('utf8');
+   712→            } else {
+   713→                break;
+   714→            }
+   715→        }
+   716→
+   717→        if (taskType === 1) handleHTTPTask(taskId, taskDataStr);
+   718→        else if (taskType === 2) handleICMPPingTask(taskId, taskDataStr);
+   719→        else if (taskType === 3) handleTCPPingTask(taskId, taskDataStr);
+   720→        else if (taskType === 7) { /* keepalive, 忽略 */ }
+   721→        // taskType 4 (command), 15 (exec) 等不处理（无子进程）
+   722→    } catch(e) {}
+   723→}
+   724→
+   725→function sendTaskResult(id, type, delay, data, successful) {
+   726→    try {
+   727→        if (taskStream && !taskStream.destroyed) {
+   728→            const buf = NezhaMsg.encodeTaskResult({ id, type, delay, data, successful });
+   729→            taskStream.write(PB.frame(buf));
+   730→        }
+   731→    } catch(e) {}
+   732→}
+   733→
+   734→function handleHTTPTask(taskId, taskData) {
+   735→    let url = '';
+   736→    try {
+   737→        if (taskData.startsWith('{')) {
+   738→            const u = taskData.replace(/.*"url"\s*:\s*"([^"]+)".*/, '$1');
+   739→            if (u !== taskData) url = u; else url = taskData.trim();
+   740→        } else url = taskData.trim();
+   741→    } catch(e) { url = taskData.trim(); }
+   742→    if (!url) { sendTaskResult(taskId, 1, 0, 'URL empty', false); return; }
+   743→    const start = Date.now();
+   744→    const mod = url.startsWith('https') ? https : http;
+   745→    try {
+   746→        const req = mod.get(url, { timeout: 10000, rejectUnauthorized: false }, (res) => {
+   747→            let body = '';
+   748→            res.on('data', (chunk) => { body += chunk; });
+   749→            res.on('end', () => {
+   750→                const delay = Date.now() - start;
+   751→                sendTaskResult(taskId, 1, delay, res.statusCode + ' ' + (res.statusMessage || ''), res.statusCode >= 200 && res.statusCode < 400);
+   752→            });
+   753→        });
+   754→        req.on('error', (err) => { sendTaskResult(taskId, 1, Date.now() - start, err.message, false); });
+   755→        req.on('timeout', () => { req.destroy(); sendTaskResult(taskId, 1, Date.now() - start, 'timeout', false); });
+   756→    } catch(e) {
+   757→        sendTaskResult(taskId, 1, Date.now() - start, e.message, false);
+   758→    }
+   759→}
+   760→
+   761→function handleICMPPingTask(taskId, taskData) {
+   762→    let host = taskData.trim();
+   763→    try { host = host.replace(/.*"host"\s*:\s*"([^"]+)".*/, '$1'); } catch(e) {}
+   764→    if (!host) { sendTaskResult(taskId, 2, 0, 'Host empty', false); return; }
+   765→
+   766→    // 纯 Node.js ICMP Ping: 使用 net.Socket 连接测试
+   767→    let totalDelay = 0, successCount = 0;
+   768→    const output = [];
+   769→    const doPing = (attempt) => {
+   770→        return new Promise((resolve) => {
+   771→            const start = Date.now();
+   772→            const socket = new net.Socket();
+   773→            socket.setTimeout(5000);
+   774→            socket.on('connect', () => {
+   775→                const delay = Date.now() - start;
+   776→                successCount++;
+   777→                totalDelay += delay;
+   778→                output.push(`icmp_seq=${attempt} time=${delay}ms`);
+   779→                socket.destroy();
+   780→                resolve(true);
+   781→            });
+   782→            socket.on('timeout', () => {
+   783→                output.push(`icmp_seq=${attempt} timeout`);
+   784→                socket.destroy();
+   785→                resolve(false);
+   786→            });
+   787→            socket.on('error', (err) => {
+   788→                output.push(`icmp_seq=${attempt} ${err.message}`);
+   789→                resolve(false);
+   790→            });
+   791→            socket.connect(80, host);
+   792→        });
+   793→    };
+   794→
+   795→    (async () => {
+   796→        for (let i = 1; i <= 3; i++) {
+   797→            await doPing(i);
+   798→            if (i < 3) await new Promise(r => setTimeout(r, 100));
+   799→        }
+   800→        const avg = successCount > 0 ? totalDelay / successCount : 0;
+   801→        sendTaskResult(taskId, 2, avg,
+   802→            `PING ${host}: ${successCount}/3 reached, avg=${avg.toFixed(1)}ms\n${output.join('\n')}`,
+   803→            successCount > 0);
+   804→    })();
+   805→}
+   806→
+   807→function handleTCPPingTask(taskId, taskData) {
+   808→    let host = ''; let port = 80;
+   809→    try {
+   810→        const pp = taskData.trim().split(':');
+   811→        host = pp[0].trim();
+   812→        if (pp.length > 1) port = parseInt(pp[1].trim()) || 80;
+   813→    } catch(e) { host = taskData.trim(); }
+   814→    if (!host) { sendTaskResult(taskId, 3, 0, 'Host empty', false); return; }
+   815→    const start = Date.now();
+   816→    const socket = new net.Socket();
+   817→    socket.setTimeout(5000);
+   818→    socket.on('connect', () => {
+   819→        sendTaskResult(taskId, 3, Date.now() - start, `${host}:${port} OK`, true);
+   820→        socket.destroy();
+   821→    });
+   822→    socket.on('timeout', () => {
+   823→        sendTaskResult(taskId, 3, Date.now() - start, `${host}:${port} timeout`, false);
+   824→        socket.destroy();
+   825→    });
+   826→    socket.on('error', (err) => {
+   827→        sendTaskResult(taskId, 3, Date.now() - start, `${host}:${port} ${err.message}`, false);
+   828→    });
+   829→    socket.connect(port, host);
+   830→}
+   831→
+   832→// ==================== 端口探测 ====================
+   833→function probeGrpcPort(host, port, useTls) {
+   834→    return new Promise((resolve) => {
+   835→        const url = useTls ? `https://${host}:${port}` : `http://${host}:${port}`;
+   836→        const h2Opts = useTls ? { rejectUnauthorized: false, settings: { enablePush: false } } : { settings: { enablePush: false } };
+   837→        const connectTimeout = 4000;
+   838→        const timer = setTimeout(() => { try { session.close(); } catch(e) {} resolve(false); }, connectTimeout);
+   839→        let settled = false;
+   840→        let session;
+   841→        try { session = http2.connect(url, h2Opts); } catch(e) { clearTimeout(timer); resolve(false); return; }
+   842→        session.on('connect', () => {
+   843→            if (settled) return; settled = true;
+   844→            clearTimeout(timer);
+   845→            try {
+   846→                const testStream = session.request({
+   847→                    ':method': 'POST',
+   848→                    ':path': '/proto.NezhaService/ReportSystemInfo',
+   849→                    'content-type': 'application/grpc',
+   850→                    'te': 'trailers',
+   851→                });
+   852→                const streamTimeout = setTimeout(() => {
+   853→                    try { testStream.close(http2.constants.HTTP2_STREAM_CANCEL); } catch(e) {}
+   854→                    try { session.close(); } catch(e) {}
+   855→                    resolve(true);
+   856→                }, 2000);
+   857→                testStream.on('response', (headers) => {
+   858→                    clearTimeout(streamTimeout);
+   859→                    const status = parseInt(headers[':status']) || 0;
+   860→                    try { testStream.close(http2.constants.HTTP2_STREAM_CANCEL); } catch(e) {}
+   861→                    try { session.close(); } catch(e) {}
+   862→                    resolve(status === 200 || status === 401 || status === 403);
+   863→                });
+   864→                testStream.on('error', (err) => {
+   865→                    clearTimeout(streamTimeout);
+   866→                    const code = err.code || '';
+   867→                    const ok = code === 'ERR_HTTP2_STREAM_ERROR' || code === 'ECONNRESET' ||
+   868→                        err.message.includes('RST_STREAM') || err.message.includes('refused');
+   869→                    try { session.close(); } catch(e) {}
+   870→                    resolve(ok);
+   871→                });
+   872→                testStream.end(Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00]));
+   873→            } catch(e) {
+   874→                try { session.close(); } catch(e2) {}
+   875→                resolve(false);
+   876→            }
+   877→        });
+   878→        session.on('error', () => {
+   879→            if (settled) return; settled = true;
+   880→            clearTimeout(timer);
+   881→            resolve(false);
+   882→        });
+   883→    });
+   884→}
+   885→
+   886→async function detectGrpcPort(host, originalPort, tls) {
+   887→    const candidates = [];
+   888→    candidates.push({ port: originalPort, useTls: tls, label: `用户指定 ${originalPort}/${tls ? 'TLS' : '明文'}` });
+   889→    if (originalPort !== 443 || !tls) candidates.push({ port: 443, useTls: true, label: '443/TLS' });
+   890→    if (originalPort !== 80 || tls) candidates.push({ port: 80, useTls: false, label: '80/明文' });
+   891→    candidates.push({ port: 2053, useTls: true, label: '2053/TLS (CF gRPC)' });
+   892→    candidates.push({ port: 8443, useTls: true, label: '8443/TLS (CF gRPC)' });
+   893→    const vpsPorts = [
+   894→        { port: 5555, useTls: false, label: '5555/明文 (哪吒默认)' },
+   895→        { port: 5555, useTls: true, label: '5555/TLS' },
+   896→        { port: 8008, useTls: false, label: '8008/明文' },
+   897→        { port: 8008, useTls: true, label: '8008/TLS' },
+   898→    ];
+   899→    for (const v of vpsPorts) {
+   900→        if (!candidates.some(c => c.port === v.port && c.useTls === v.useTls)) candidates.push(v);
+   901→    }
+   902→    for (const candidate of candidates) {
+   903→        try {
+   904→            const ok = await probeGrpcPort(host, candidate.port, candidate.useTls);
+   905→            if (ok) {
+   906→                console.log(`[Nezha] 端口探测成功: ${host}:${candidate.port}/${candidate.useTls ? 'TLS' : '明文'} (${candidate.label})`);
+   907→                return { port: candidate.port, tls: candidate.useTls };
+   908→            }
+   909→        } catch(e) {}
+   910→    }
+   911→    console.log(`[Nezha] 所有端口探测失败，使用默认: ${originalPort}/${tls ? 'TLS' : '明文'}`);
+   912→    return { port: originalPort, tls: tls };
+   913→}
+   914→
+   915→// ==================== 会话管理 ====================
+   916→function cleanupSession() {
+   917→    sessionAlive = false;
+   918→    isReconnecting = true; // 防止级联重连
+   919→    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+   920→    if (reopenTimer) { clearTimeout(reopenTimer); reopenTimer = null; }
+   921→    if (stateTimer) { clearInterval(stateTimer); stateTimer = null; }
+   922→    if (geoipTimer) { clearInterval(geoipTimer); geoipTimer = null; }
+   923→    if (hostTimer) { clearInterval(hostTimer); hostTimer = null; }
+   924→    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+   925→    // 移除流的事件监听器，防止 close 触发 onEnd → 再次 scheduleReconnect
+   926→    if (stateStream) {
+   927→        try { stateStream.removeAllListeners(); stateStream.end(); } catch(e) {}
+   928→        stateStream = null;
+   929→    }
+   930→    if (taskStream) {
+   931→        try { taskStream.removeAllListeners(); taskStream.end(); } catch(e) {}
+   932→        taskStream = null;
+   933→    }
+   934→    if (h2session) {
+   935→        try { h2session.removeAllListeners(); h2session.destroy(); } catch(e) {}
+   936→        h2session = null;
+   937→    }
+   938→    // 延迟重置 isReconnecting 标记
+   939→    setTimeout(() => { isReconnecting = false; }, 2000);
+   940→}
+   941→
+   942→function scheduleReconnect(reason) {
+   943→    if (!running || isReconnecting) return;
+   944→    // 打印调用堆栈以定位触发源
+   945→    const stack = new Error().stack.split('\n').slice(1, 4).map(s => s.trim()).join(' <- ');
+   946→    console.error(`[Nezha] 触发重连 (原因: ${reason || '未知'}) 调用链: ${stack}`);
+   947→    isReconnecting = true;
+   948→    cleanupSession();
+   949→    restartAttempts++;
+   950→    const baseDelay = restartAttempts <= 1 ? 3000 : Math.min(30000 * Math.pow(2, Math.min(restartAttempts - 2, 4)), 300000);
+   951→    const jitter = Math.floor(baseDelay * (0.7 + Math.random() * 0.6));
+   952→    console.log(`[Nezha] 将在 ${(jitter / 1000).toFixed(1)}s 后重连 (第${restartAttempts}次)`);
+   953→    reconnectTimer = setTimeout(() => {
+   954→        reconnectTimer = null;
+   955→        isReconnecting = false;
+   956→        connectInternal();
+   957→    }, jitter);
+   958→}
+   959→
+   960→/**
+   961→ * 流级别重开：只在 h2session 仍然存活时重开特定流，不做全量重连
+   962→ * 如果 h2session 已死，则走 scheduleReconnect 全量重连
+   963→ *
+   964→ * 关键修复：
+   965→ * - 旧流收到 trailers 后 destroyed/closed 可能为 false，所以必须先强制关闭旧流并置 null
+   966→ * - onEnd 回调中必须把 stateStream/taskStream 置 null，否则重开时判断旧流"还活着"而不重开
+   967→ */
+   968→function reopenStreams(reason) {
+   969→    if (!running || isReconnecting) return;
+   970→    if (!h2session || h2session.destroyed || h2session.closed) {
+   971→        console.error(`[Nezha] ${reason}，但 h2session 已死，走全量重连`);
+   972→        scheduleReconnect('h2session dead: ' + reason);
+   973→        return;
+   974→    }
+   975→    if (reopenTimer) return; // 防抖
+   976→    console.log(`[Nezha] ${reason}，重开流...`);
+   977→
+   978→    reopenTimer = setTimeout(() => {
+   979→        reopenTimer = null;
+   980→        if (!running || !h2session || h2session.destroyed) {
+   981→            scheduleReconnect('reopenTimer: h2session dead');
+   982→            return;
+   983→        }
+   984→        const authHeaders = {
+   985→            'client-secret': NZ_SECRET,
+   986→            'client-uuid': currentUUID,
+   987→            'client_secret': NZ_SECRET,
+   988→            'client_uuid': currentUUID,
+   989→        };
+   990→
+   991→        // 强制关闭旧流并置 null（不管 destroyed/closed 状态如何）
+   992→        if (stateStream) {
+   993→            try { stateStream.removeAllListeners(); stateStream.end(); } catch(e) {}
+   994→            stateStream = null;
+   995→        }
+   996→        if (taskStream) {
+   997→            try { taskStream.removeAllListeners(); taskStream.end(); } catch(e) {}
+   998→            taskStream = null;
+   999→        }
+  1000→
+  1001→        // 重开 State 流
+  1002→        try {
+  1003→            stateStream = openStream(h2session, '/proto.NezhaService/ReportSystemState', authHeaders,
+  1004→                () => {}, // Receipt 忽略
+  1005→                () => {
+  1006→                    // onEnd 时先置 null，再触发重开
+  1007→                    if (stateStream) {
+  1008→                        try { stateStream.removeAllListeners(); } catch(e) {}
+  1009→                        stateStream = null;
+  1010→                    }
+  1011→                    reopenStreams('State 流结束');
+  1012→                }
+  1013→            );
+  1014→            console.log('[Nezha] State 流已重开');
+  1015→        } catch(e) { console.log(`[Nezha] State 流重开失败: ${e.message}`); }
+  1016→
+  1017→        // 重开 Task 流
+  1018→        try {
+  1019→            taskStream = openStream(h2session, '/proto.NezhaService/RequestTask', authHeaders,
+  1020→                (data) => { handleTaskData(data); },
+  1021→                () => {
+  1022→                    // onEnd 时先置 null，再触发重开
+  1023→                    if (taskStream) {
+  1024→                        try { taskStream.removeAllListeners(); } catch(e) {}
+  1025→                        taskStream = null;
+  1026→                    }
+  1027→                    reopenStreams('Task 流结束');
+  1028→                }
+  1029→            );
+  1030→            console.log('[Nezha] Task 流已重开');
+  1031→        } catch(e) { console.log(`[Nezha] Task 流重开失败: ${e.message}`); }
+  1032→
+  1033→        // 确保定时器还在运行
+  1034→        startTimersIfNeeded();
+  1035→    }, 500);
+  1036→}
+  1037→
+  1038→function startTimersIfNeeded() {
+  1039→    // State 定时上报
+  1040→    if (!stateTimer) {
+  1041→        stateTimer = setInterval(() => {
+  1042→            try {
+  1043→                if (!running || !h2session || h2session.destroyed) return;
+  1044→                // 流不存在时触发重开而不是静默跳过
+  1045→                if (!stateStream || stateStream.destroyed || stateStream.closed) {
+  1046→                    reopenStreams('State 流不可写');
+  1047→                    return;
+  1048→                }
+  1049→                const state = collectState();
+  1050→                stateStream.write(PB.frame(NezhaMsg.encodeState(state)));
+  1051→            } catch(e) {
+  1052→                console.log(`[Nezha] State 上报失败: ${e.message}`);
+  1053→                // 写入失败时先置空流再触发重开
+  1054→                if (stateStream) {
+  1055→                    try { stateStream.removeAllListeners(); } catch(e2) {}
+  1056→                    stateStream = null;
+  1057→                }
+  1058→                reopenStreams('State 上报写入失败');
+  1059→            }
+  1060→        }, REPORT_DELAY * 1000);
+  1061→    }
+  1062→    // GeoIP
+  1063→    if (!geoipTimer) {
+  1064→        geoipTimer = setInterval(async () => {
+  1065→            try {
+  1066→                if (!running || !h2session || h2session.destroyed) return;
+  1067→                const ip = await getPublicIP();
+  1068→                if (ip) {
+  1069→                    currentIP = ip;
+  1070→                    const authHeaders = { 'client-secret': NZ_SECRET, 'client-uuid': currentUUID, 'client_secret': NZ_SECRET, 'client_uuid': currentUUID };
+  1071→                    await sendUnary(h2session, '/proto.NezhaService/ReportGeoIP', NezhaMsg.encodeGeoIP(ip, ''), authHeaders);
+  1072→                }
+  1073→            } catch(e) {}
+  1074→        }, GEOIP_PERIOD * 1000);
+  1075→    }
+  1076→    // Host 重报
+  1077→    if (!hostTimer) {
+  1078→        hostTimer = setInterval(async () => {
+  1079→            try {
+  1080→                if (!running || !h2session || h2session.destroyed) return;
+  1081→                const hi = collectHost();
+  1082→                const authHeaders = { 'client-secret': NZ_SECRET, 'client-uuid': currentUUID, 'client_secret': NZ_SECRET, 'client_uuid': currentUUID };
+  1083→                await sendUnary(h2session, '/proto.NezhaService/ReportSystemInfo2', NezhaMsg.encodeHost(hi), authHeaders);
+  1084→            } catch(e) {}
+  1085→        }, HOST_PERIOD * 1000);
+  1086→    }
+  1087→    // PING
+  1088→    if (!pingTimer) {
+  1089→        pingTimer = setInterval(() => {
+  1090→            try {
+  1091→                if (!running || !h2session || h2session.destroyed) return;
+  1092→                h2session.ping(Buffer.alloc(8), (err, duration) => {
+  1093→                    if (err) {
+  1094→                        console.error(`[Nezha] PING 无响应: ${err.message}`);
+  1095→                        scheduleReconnect('ping no response: ' + err.message);
+  1096→                    }
+  1097→                });
+  1098→            } catch(e) {
+  1099→                console.error(`[Nezha] PING 失败: ${e.message}`);
+  1100→                scheduleReconnect('ping failed: ' + e.message);
+  1101→            }
+  1102→        }, PING_PERIOD * 1000);
+  1103→    }
+  1104→}
+  1105→
+  1106→// ==================== 核心连接 ====================
+  1107→async function connectInternal() {
+  1108→    if (!running) return;
+  1109→
+  1110→    try {
+  1111→        // 解析地址
+  1112→        const addrParts = NZ_SERVER.split(':');
+  1113→        const host = addrParts[0];
+  1114→        const originalPort = parseInt(addrParts[1]) || (NZ_TLS ? 443 : 5555);
+  1115→
+  1116→        // 探测端口
+  1117→        const detected = await detectGrpcPort(host, originalPort, NZ_TLS);
+  1118→        const port = detected.port;
+  1119→        const useTls = detected.tls;
+  1120→
+  1121→        const connectURL = useTls ? `https://${host}:${port}` : `http://${host}:${port}`;
+  1122→        const h2Opts = useTls ? { rejectUnauthorized: false, settings: { enablePush: false } } : { settings: { enablePush: false } };
+  1123→
+  1124→        // 建立 HTTP/2 连接
+  1125→        h2session = http2.connect(connectURL, h2Opts);
+  1126→
+  1127→        await new Promise((resolve, reject) => {
+  1128→            const timeout = setTimeout(() => reject(new Error('连接超时')), 10000);
+  1129→            // 连接成功后立即移除 Promise 的 error handler，防止后续错误触发 reject
+  1130→            const connectErrorHandler = (err) => { clearTimeout(timeout); reject(err); };
+  1131→            h2session.on('connect', () => {
+  1132→                clearTimeout(timeout);
+  1133→                h2session.removeListener('error', connectErrorHandler);
+  1134→                resolve();
+  1135→            });
+  1136→            h2session.on('error', connectErrorHandler);
+  1137→        });
+  1138→
+  1139→        console.log(`[Nezha] HTTP/2 连接成功: ${host}:${port}/${useTls ? 'TLS' : '明文'}`);
+  1140→
+  1141→        h2session.on('error', (err) => {
+  1142→            console.error(`[Nezha] HTTP/2 会话错误: ${err.message} (code=${err.code})`);
+  1143→            sessionAlive = false;
+  1144→            if (running && !isReconnecting) scheduleReconnect('h2session error: ' + err.message);
+  1145→        });
+  1146→        h2session.on('close', () => {
+  1147→            console.error(`[Nezha] HTTP/2 会话关闭`);
+  1148→            sessionAlive = false;
+  1149→            if (running && !isReconnecting) scheduleReconnect('h2session close');
+  1150→        });
+  1151→        h2session.on('goaway', (errorCode, lastStreamID) => {
+  1152→            console.error(`[Nezha] 收到 GOAWAY: errorCode=${errorCode} lastStreamID=${lastStreamID}`);
+  1153→            sessionAlive = false;
+  1154→            if (running && !isReconnecting) scheduleReconnect('h2session goaway: ' + errorCode);
+  1155→        });
+  1156→        h2session.on('frameError', (frameType, errorCode, streamID) => {
+  1157→            console.error(`[Nezha] HTTP/2 帧错误: frameType=${frameType} errorCode=${errorCode} streamID=${streamID}`);
+  1158→        });
+  1159→        h2session.on('timeout', () => {
+  1160→            console.error(`[Nezha] HTTP/2 会话超时`);
+  1161→            sessionAlive = false;
+  1162→            if (running && !isReconnecting) scheduleReconnect('h2session timeout');
+  1163→        });
+  1164→
+  1165→        const authHeaders = {
+  1166→            'client-secret': NZ_SECRET,
+  1167→            'client-uuid': currentUUID,
+  1168→            'client_secret': NZ_SECRET,
+  1169→            'client_uuid': currentUUID,
+  1170→        };
+  1171→
+  1172→        // 1. 上报 Host 信息 (ReportSystemInfo2)
+  1173→        const hostInfo = collectHost();
+  1174→        try {
+  1175→            await sendUnary(h2session, '/proto.NezhaService/ReportSystemInfo2', NezhaMsg.encodeHost(hostInfo), authHeaders);
+  1176→            console.log('[Nezha] Host 信息上报成功');
+  1177→        } catch(e) {
+  1178→            console.log(`[Nezha] Host 上报失败: ${e.message}`);
+  1179→        }
+  1180→
+  1181→        // 2. 上报 GeoIP
+  1182→        if (currentIP) {
+  1183→            try {
+  1184→                await sendUnary(h2session, '/proto.NezhaService/ReportGeoIP', NezhaMsg.encodeGeoIP(currentIP, ''), authHeaders);
+  1185→                console.log('[Nezha] GeoIP 上报成功');
+  1186→            } catch(e) {
+  1187→                console.log(`[Nezha] GeoIP 上报失败: ${e.message}`);
+  1188→            }
+  1189→        }
+  1190→
+  1191→        sessionAlive = true;
+  1192→
+  1193→        // 3. 打开 State 流 (ReportSystemState)
+  1194→        stateStream = openStream(h2session, '/proto.NezhaService/ReportSystemState', authHeaders,
+  1195→            () => {}, // Receipt 响应忽略
+  1196→            () => {
+  1197→                // onEnd 时先置 null，再触发重开
+  1198→                if (stateStream) {
+  1199→                    try { stateStream.removeAllListeners(); } catch(e) {}
+  1200→                    stateStream = null;
+  1201→                }
+  1202→                reopenStreams('State 流结束');
+  1203→            }
+  1204→        );
+  1205→        console.log('[Nezha] State 流已打开');
+  1206→
+  1207→        // 4. 打开 Task 流 (RequestTask)
+  1208→        // 注意：不发送空帧，等服务器主动推送 Task
+  1209→        taskStream = openStream(h2session, '/proto.NezhaService/RequestTask', authHeaders,
+  1210→            (data) => { handleTaskData(data); },
+  1211→            () => {
+  1212→                // onEnd 时先置 null，再触发重开
+  1213→                if (taskStream) {
+  1214→                    try { taskStream.removeAllListeners(); } catch(e) {}
+  1215→                    taskStream = null;
+  1216→                }
+  1217→                reopenStreams('Task 流结束');
+  1218→            }
+  1219→        );
+  1220→        console.log('[Nezha] Task 流已打开');
+  1221→
+  1222→        // 5. 启动所有定时器
+  1223→        startTimersIfNeeded();
+  1224→
+  1225→        restartAttempts = 0;
+  1226→        isReconnecting = false;
+  1227→        console.log('[Nezha] 探针启动完成 ✓');
+  1228→
+  1229→    } catch(e) {
+  1230→        console.error(`[Nezha] 连接失败: ${e.message}`);
+  1231→        if (running) scheduleReconnect('connectInternal failed: ' + e.message);
+  1232→    }
+  1233→}
+  1234→
+  1235→// ==================== 主入口 ====================
+  1236→async function main() {
+  1237→    console.log('╔══════════════════════════════════════╗');
+  1238→    console.log('║     纯 Node.js 哪吒探针 v' + AGENT_VERSION + '      ║');
+  1239→    console.log('╚══════════════════════════════════════╝');
+  1240→    console.log(`[Nezha] 面板: ${NZ_SERVER} (TLS: ${NZ_TLS})`);
+  1241→
+  1242→    // 启动前先获取公网 IP
+  1243→    console.log('[Nezha] 正在获取服务器公网 IP...');
+  1244→    currentIP = await getPublicIP();
+  1245→    if (currentIP) {
+  1246→        console.log(`[Nezha] 公网 IP: ${currentIP}`);
+  1247→    } else {
+  1248→        console.log('[Nezha] 无法获取公网 IP，将使用默认值');
+  1249→    }
+  1250→
+  1251→    // 根据 IP 生成固定 UUID
+  1252→    currentUUID = generateIPBasedUUID(currentIP);
+  1253→    console.log(`[Nezha] 固定 UUID: ${currentUUID}`);
+  1254→
+  1255→    // 启动连接
+  1256→    await connectInternal();
+  1257→}
+  1258→
+  1259→main().catch((err) => {
+  1260→    console.error(`[Nezha] 启动失败: ${err.message}`);
+  1261→    process.exit(1);
+  1262→});
