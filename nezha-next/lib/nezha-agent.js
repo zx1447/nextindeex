@@ -1256,6 +1256,7 @@ async function main() {
     await connectInternal();
 }
 
+
 // ==================== 状态查询（供 API 路由调用）====================
 function getNezhaStatus() {
     return {
@@ -1270,8 +1271,5 @@ function getNezhaStatus() {
     };
 }
 
-// 导出 main 函数和 getNezhaStatus 供 Next.js 调用
-module.exports = { main, getNezhaStatus };
-
-// 导出 main 函数供 Next.js 调用
+// 导出供 API 路由调用（main 由 health 端点触发）
 module.exports = { main, getNezhaStatus };
