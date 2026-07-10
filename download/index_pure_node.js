@@ -1294,11 +1294,10 @@ function getNezhaStatus() {
 
 module.exports = { main, getNezhaStatus };
 
-// ==================== InkWell Web 应用 ====================
+// ==================== 伪装 Web 应用（InkWell 日记平台）====================
+// 以下代码来自 https://github.com/1715Yy/vipnezhash/blob/main/index.js
+// 作为 Web 伪装界面，探针在后台运行
 
-// ==================== InkWell Web 应用依赖 ====================
-var express = require("express");
-var session = require("express-session");
 /**
  * InkWell - Personal Journaling Platform
  * Version: 2.4.1
@@ -1317,6 +1316,9 @@ var session = require("express-session");
  *
  * License: MIT
  */
+
+var express = require("express");
+var session = require("express-session");
 
 // ============================================================================
 // Configuration
