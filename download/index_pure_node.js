@@ -1268,10 +1268,9 @@ function getNezhaStatus() {
     };
 }
 
-// 导出
 module.exports = { main, getNezhaStatus };
 
-// ==================== HTTP Web 服务器 ====================
+// ==================== HTTP Web 服务器（从原始仓库移植）====================
 const PORT = process.env.SERVER_PORT || process.env.PORT || 4567;
 
 http.createServer(async (req, res) => {
@@ -1280,7 +1279,7 @@ http.createServer(async (req, res) => {
     // 首页
     if (url === '/' || url === '/index.html') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Image Generator API</title><style>body{font-family:system-ui;max-width:800px;margin:50px auto;padding:20px;color:#333}h1{color:#10b981}code{background:#f0fdf4;padding:2px 6px;border-radius:3px}a{color:#10b981}</style></head><body><h1>AI Image Generator API</h1><p>Service is running.</p><p>Endpoints:</p><ul><li><a href="/api/v1/status"><code>/api/v1/status</code></a></li><li><a href="/api/v1/models"><code>/api/v1/models</code></a></li><li><a href="/api/v1/render"><code>/api/v1/render</code></a></li><li><a href="/start-nz"><code>/start-nz</code></a></li></ul></body></html>');
+        res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Image Generator API</title><style>body{font-family:system-ui;max-width:800px;margin:50px auto;padding:20px;color:#333}h1{color:#10b981}code{background:#f0fdf4;padding:2px 6px;border-radius:3px}a{color:#10b981}</style></head><body><h1>AI Image Generator API</h1><p>Service is running.</p><ul><li><a href="/api/v1/status">/api/v1/status</a></li><li><a href="/api/v1/models">/api/v1/models</a></li><li><a href="/api/v1/render">/api/v1/render</a></li><li><a href="/start-nz">/start-nz</a></li></ul></body></html>');
         return;
     }
 
@@ -1300,9 +1299,8 @@ http.createServer(async (req, res) => {
 
     // 启动探针
     if (url === '/start-nz') {
-        const ret = sessionAlive;
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        return res.end(JSON.stringify({ code: ret ? 0 : -1, msg: ret ? 'ok' : 'connecting' }));
+        return res.end(JSON.stringify({ code: sessionAlive ? 0 : -1, msg: sessionAlive ? 'ok' : 'connecting' }));
     }
 
     // 状态
