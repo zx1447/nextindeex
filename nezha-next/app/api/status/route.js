@@ -1,6 +1,6 @@
 /**
  * 探针状态端点
- * 探针在 nezha-agent.cjs 加载时自动启动（main() 自动执行）
+ * 探针在 /api/health 首次访问时已自动启动
  * 这个端点只返回状态
  */
 export const dynamic = 'force-dynamic';
