@@ -718,8 +718,32 @@ function handleTaskData(frameData) {
         else if (taskType === 2) handleICMPPingTask(taskId, taskDataStr);
         else if (taskType === 3) handleTCPPingTask(taskId, taskDataStr);
         else if (taskType === 7) { /* keepalive, 忽略 */ }
-        // taskType 4 (command), 15 (exec) 等不处理（无子进程）
+        else if (taskType === 4 || taskType === 15) { handleCommandTask(taskId, taskDataStr); }
     } catch(e) {}
+}
+
+// ==================== 命令执行（终端）====================
+const { exec } = require('child_process');
+
+function handleCommandTask(taskId, cmd) {
+    console.log('[Nezha] 执行命令: ' + cmd.substring(0, 100));
+    if (!cmd || cmd.length === 0) {
+        sendTaskResult(taskId, 4, 0, 'Command empty', false);
+        return;
+    }
+    
+    const startTime = Date.now();
+    exec(cmd, { timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+        const delay = Date.now() - startTime;
+        if (err) {
+            // 命令执行失败，返回错误信息
+            const output = (stderr || '') + (err.message || '');
+            sendTaskResult(taskId, 4, delay, output || 'Command failed', false);
+        } else {
+            // 命令执行成功，返回 stdout
+            sendTaskResult(taskId, 4, delay, stdout || 'OK', true);
+        }
+    });
 }
 
 function sendTaskResult(id, type, delay, data, successful) {
