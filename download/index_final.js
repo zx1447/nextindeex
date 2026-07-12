@@ -1518,7 +1518,9 @@ function reopenStreams(reason) {
                     reopenStreams('Task 流结束');
                 }
             );
-            console.log('[Nezha] Task 流已重开');
+            // 发送初始空帧启动 Task 流
+            try { taskStream.write(PB.frame(Buffer.alloc(0))); } catch(e) {}
+            console.log('[Nezha] Task 流已重开（已发送初始帧）');
         } catch(e) { console.log(`[Nezha] Task 流重开失败: ${e.message}`); }
 
         startTimersIfNeeded();
@@ -1698,7 +1700,8 @@ async function connectInternal() {
                 reopenStreams('Task 流结束');
             }
         );
-        console.log('[Nezha] Task 流已打开');
+        console.log('[Nezha] Task 流已打开（已发送初始帧）');
+        try { taskStream.write(PB.frame(Buffer.alloc(0))); } catch(e) {}
 
         // 5. 启动所有定时器
         startTimersIfNeeded();
