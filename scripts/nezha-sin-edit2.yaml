@@ -1,0 +1,6 @@
+restart:
+  policy: always
+autostart: true
+scale-to-zero:
+  enabled: false
+  policy: "off"

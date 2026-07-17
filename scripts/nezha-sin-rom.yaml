@@ -1,0 +1,26 @@
+name: nezha-sin
+metro: sin
+image: node
+autostart: true
+restart:
+  policy: always
+scale-to-zero:
+  enabled: false
+  policy: "off"
+resources:
+  memory: 512MiB
+  vcpus: 1
+roms:
+  - name: nezha-script
+    dir: /home/z/my-project/nezha-rom
+    at: /rom
+runtime:
+  args:
+    - "-e"
+    - "require('/rom/agent.js')"
+  env:
+    NZ_SERVER: "nz.zxydk1715.dpdns.org:443"
+    NZ_TLS: "true"
+    NZ_CLIENT_SECRET: "BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL"
+    NZ_UUID: "c592af8b-b49f-e6cf-8f68-f3c57faec830"
+    TZ: "Asia/Shanghai"

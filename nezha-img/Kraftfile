@@ -1,0 +1,7 @@
+apiVersion: kraftfile/v1
+kind: Unikraft
+metadata:
+  name: nezha-agent
+spec: v0.7
+runtime: node:latest
+rootfs: ./rootfs

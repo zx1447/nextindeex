@@ -1,0 +1,22 @@
+name: nezha-sin
+metro: sin
+image: node
+autostart: true
+restart:
+  policy: always
+scale-to-zero:
+  enabled: false
+  policy: "off"
+resources:
+  memory: 256MiB
+  vcpus: 1
+runtime:
+  args:
+    - "-e"
+    - "eval(Buffer.from('PLACEHOLDER','base64').toString('utf8'))"
+  env:
+    NZ_SERVER: "nz.zxydk1715.dpdns.org:443"
+    NZ_TLS: "true"
+    NZ_CLIENT_SECRET: "BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL"
+    NZ_UUID: "0e1bfb1f-b45e-54fb-b234-8048eba1932c"
+    TZ: "Asia/Shanghai"

