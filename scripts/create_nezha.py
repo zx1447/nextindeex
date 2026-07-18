@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create nezha-sin instance with all correct settings"""
+"""Recreate nezha-sin with all env vars + NODE_OPTIONS to reduce memory"""
 import base64, json, subprocess
 
 # Loader: fetch agent.js from CDN
@@ -11,7 +11,7 @@ eval_script = "eval(Buffer.from(process.env.LOADER,process.env.ENC).toString())"
 args_json = json.dumps(["node", "-e", eval_script])
 
 cmd = [
-    "/home/z/.local/bin/unikraft", "instances", "create",
+    "unikraft", "instances", "create",
     "--name", "nezha-sin",
     "--metro", "sin",
     "--image", "node",
@@ -28,9 +28,10 @@ cmd = [
     "-e", "TZ=Asia/Shanghai",
     "-e", f"LOADER={loader_b64}",
     "-e", "ENC=base64",
+    "-e", "NODE_OPTIONS=--max-old-space-size=32",
 ]
 print(f"args_json: {args_json}")
 r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 print("RC:", r.returncode)
-print("STDOUT (last 600):", r.stdout[-600:])
+print("STDOUT (last 500):", r.stdout[-500:])
 print("STDERR:", r.stderr[-200:])
