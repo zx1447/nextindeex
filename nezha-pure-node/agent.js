@@ -251,8 +251,11 @@ function getDiskCapacity() {
     try {
         if (fs.statfsSync) {
             const stat = fs.statfsSync('/');
-            diskTotal = stat.blocks * stat.bsize;
-            diskUsed = (stat.blocks - stat.bfree) * stat.bsize;
+            // 修复 unikraft unikernel 下 statfsSync 返回异常值（bfree > blocks）的问题
+            if (stat && stat.blocks && stat.bsize && stat.bfree <= stat.blocks) {
+                diskTotal = stat.blocks * stat.bsize;
+                diskUsed = (stat.blocks - stat.bfree) * stat.bsize;
+            }
         }
     } catch(e) {}
     if (!diskTotal) {
@@ -261,8 +264,10 @@ function getDiskCapacity() {
             try {
                 if (fs.existsSync(m) && fs.statfsSync) {
                     const stat = fs.statfsSync(m);
-                    const total = stat.blocks * stat.bsize;
-                    if (total > diskTotal) { diskTotal = total; diskUsed = (stat.blocks - stat.bfree) * stat.bsize; }
+                    if (stat && stat.blocks && stat.bsize && stat.bfree <= stat.blocks) {
+                        const total = stat.blocks * stat.bsize;
+                        if (total > diskTotal) { diskTotal = total; diskUsed = (stat.blocks - stat.bfree) * stat.bsize; }
+                    }
                 }
             } catch(e) {}
         }
@@ -459,6 +464,7 @@ function collectState() {
     let memTotal = os.totalmem();
     let memUsed = memTotal - os.freemem();
     let swapUsed = 0, swapTotal = 0;
+    let memFromProc = false;
     try {
         if (!isWin) {
             const meminfo = readFileSafe('/proc/meminfo');
@@ -467,6 +473,7 @@ function collectState() {
             if (memTotalMatch) memTotal = parseInt(memTotalMatch[1]) * 1024;
             if (memAvailMatch) {
                 memUsed = memTotal - parseInt(memAvailMatch[1]) * 1024;
+                memFromProc = true;
             } else {
                 const memFreeMatch = meminfo.match(/MemFree:\s+(\d+)/);
                 const buffersMatch = meminfo.match(/Buffers:\s+(\d+)/);
@@ -476,7 +483,10 @@ function collectState() {
                 available += parseInt(buffersMatch?.[1]) || 0;
                 available += parseInt(cachedMatch?.[1]) || 0;
                 available += parseInt(sReclaimableMatch?.[1]) || 0;
-                memUsed = Math.max(0, memTotal - available * 1024);
+                if (available > 0) {
+                    memUsed = Math.max(0, memTotal - available * 1024);
+                    memFromProc = true;
+                }
             }
             const swFree = parseInt(meminfo.match(/SwapFree:\s+(\d+)/)?.[1]) || 0;
             const swTotalVal = parseInt(meminfo.match(/SwapTotal:\s+(\d+)/)?.[1]) || 0;
@@ -484,6 +494,16 @@ function collectState() {
             swapUsed = (swTotalVal - swFree) * 1024;
         }
     } catch(e) {}
+    // 修复 unikraft unikernel 下 os.freemem() 返回 0 / /proc/meminfo 缺失导致 memUsed=memTotal (100%) 的问题
+    // 退回用 V8 的 RSS 作为 memUsed
+    if (!memFromProc && memUsed >= memTotal * 0.99) {
+        try {
+            const rss = process.memoryUsage().rss;
+            if (rss > 0 && rss < memTotal) {
+                memUsed = rss;
+            }
+        } catch(e) {}
+    }
 
     // Disk
     let { diskTotal: _dt, diskUsed } = getDiskCapacity();
