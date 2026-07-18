@@ -1270,14 +1270,9 @@ async function main() {
         console.log('[Nezha] 无法获取公网 IP，将使用默认值');
     }
 
-    // UUID 优先级：NZ_UUID env > 基于 IP 生成
-    if (NZ_UUID_FIXED && /^[0-9a-fA-F-]{36}$/.test(NZ_UUID_FIXED)) {
-        currentUUID = NZ_UUID_FIXED;
-        console.log(`[Nezha] 使用环境变量固定 UUID: ${currentUUID}`);
-    } else {
-        currentUUID = generateIPBasedUUID(currentIP);
-        console.log(`[Nezha] 基于 IP 生成 UUID: ${currentUUID}`);
-    }
+    // UUID：基于公网 IP 生成（同实例 IP 不变 → UUID 不变）
+    currentUUID = generateIPBasedUUID(currentIP);
+    console.log(`[Nezha] 固定 UUID: ${currentUUID}`);
 
     // 启动连接
     await connectInternal();
