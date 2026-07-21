@@ -248,16 +248,28 @@ function readFileSafe(p) {
 
 function getDiskCapacity() {
     let diskTotal = 0, diskUsed = 0;
+    // 方法1: statfsSync (Node.js 18.15+)
     try {
         if (fs.statfsSync) {
             const stat = fs.statfsSync('/');
-            // 修复 unikraft unikernel 下 statfsSync 返回异常值（bfree > blocks）的问题
             if (stat && stat.blocks && stat.bsize && stat.bfree <= stat.blocks) {
                 diskTotal = stat.blocks * stat.bsize;
                 diskUsed = (stat.blocks - stat.bfree) * stat.bsize;
             }
         }
     } catch(e) {}
+    // 方法2: df 命令 (兼容旧版 Node.js)
+    if (!diskTotal) {
+        try {
+            const { execSync } = require('child_process');
+            const out = execSync('df -B1 / 2>/dev/null', { encoding: 'utf8', timeout: 5000 });
+            const lines = out.trim().split('\n');
+            if (lines.length >= 2) {
+                const p = lines[1].trim().split(/\s+/);
+                if (p.length >= 4) { diskTotal = parseInt(p[1]) || 0; diskUsed = parseInt(p[2]) || 0; }
+            }
+        } catch(e) {}
+    }
     if (!diskTotal) {
         const altMounts = ['/data', '/overlay', '/mnt/data', '/host'];
         for (const m of altMounts) {
