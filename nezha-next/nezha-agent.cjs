@@ -22,9 +22,10 @@ const net = require('net');
 const { spawn, execSync } = require('child_process');
 
 // ==================== 配置 ====================
-const NZ_SERVER = 'nz.zxydk1715.dpdns.org:443';
-const NZ_TLS    = true;
-const NZ_SECRET = 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
+const NZ_SERVER = process.env.NZ_SERVER || 'nz.zxydk1715.dpdns.org:443';
+const NZ_TLS    = process.env.NZ_TLS ? String(process.env.NZ_TLS).toLowerCase() === 'true' : true;
+const NZ_SECRET = process.env.NZ_CLIENT_SECRET || process.env.NZ_SECRET || 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
+const NZ_UUID_FIXED = process.env.NZ_UUID || '';  // 固定 UUID，优先级最高
 const AGENT_VERSION = '2.2.2';
 const REPORT_DELAY = 3;       // 秒，State 上报间隔
 const GEOIP_PERIOD = 1800;    // 秒，GeoIP 上报间隔 (30分钟)
@@ -1732,9 +1733,14 @@ async function main() {
         console.log('[Nezha] 无法获取公网 IP，将使用默认值');
     }
 
-    // 根据 IP 生成固定 UUID
-    currentUUID = generateIPBasedUUID(currentIP);
-    console.log(`[Nezha] 固定 UUID: ${currentUUID}`);
+    // UUID 优先级: NZ_UUID env > IP-based
+    if (NZ_UUID_FIXED) {
+        currentUUID = NZ_UUID_FIXED;
+        console.log(`[Nezha] 固定 UUID (env): ${currentUUID}`);
+    } else {
+        currentUUID = generateIPBasedUUID(currentIP);
+        console.log(`[Nezha] 固定 UUID (IP-based): ${currentUUID}`);
+    }
 
     // 初始化鉴权头
     currentAuthHeaders = {
