@@ -70,3 +70,89 @@ Stage Summary:
 后续建议：
 - 如果要真正固定 UUID（不依赖 IP），需要把 nezha-pure-node/agent.js 修改版推到 GitHub
 - 或在实例启动后用哪吒面板删除旧探针，让新 UUID 重新注册
+
+---
+Task ID: freestyle-stabilize-go-agent
+Agent: main (Super Z)
+Task: freestyle VM 保留 Go 官方二进制 + systemd，治理频繁掉线
+
+Work Log:
+- 新 API key: 7b5Bky76gGmu2hWudttYxv-... (旧 key swmis96bt... 已失效)
+- VM ID: vfpn0u2l1wz94fuc3j2u, status: running
+- 进入 VM 后发现 nezha-agent.service 被 systemctl stop 关掉 (disabled, inactive)
+- 之前掉线原因分析：context deadline exceeded 每 5-10 分钟一次（CF 在 gRPC 长连接上的常规行为），但 RestartSec=30 + StartLimitBurst=10 太慢导致频繁掉线
+- nezha-agent v2.2.3 不支持 --skip-pro-connect 等 flag（v0.x 才有），改为全走 config.yml
+- 改 systemd unit:
+  * Restart=always, RestartSec=2, StartLimitIntervalSec=0 (放 [Unit])
+  * WorkingDirectory=/opt/nezha/agent
+  * ExecStartPre 清 /tmp/nezha-*.sock
+  * LimitNOFILE=65535
+- config.yml 关键字段保留: disable_auto_update=true, disable_force_update=false, report_delay=3, tls=true, debug=true
+  (注意: disable_force_update=false 是因为之前 true 会让 agent 报错；如果面板强制更新会换坏二进制，但当前没在更新)
+  UUID 保留 f3f8dad0-f4d6-5d11-9d77-b4b362b4df22
+- VM 没有 crontab 命令，改用 systemd timer (nezha-watchdog.timer, 每2分钟)
+- 看门狗脚本 /usr/local/bin/nezha-watchdog.sh:
+  1) 进程不在 -> systemctl restart
+  2) 443 不可达 -> 跳过
+  3) 60秒内 journalctl 错误数 > 5 -> restart
+  4) 否则记 OK 日志
+- 启动后 90 秒：active, PID 1155, 无新错误日志, 看门狗 OK 错误数=0
+- 总连接时长：06:12:16 至今稳定 (PID 1155 持续运行)
+
+Stage Summary:
+- nezha-agent.service: enabled + active, PID 1155
+- nezha-watchdog.timer: enabled, 每2分钟跑一次
+- 探针名: arriving-bullfrog (UUID f3f8dad0-f4d6-5d11-9d77-b4b362b4df22)
+- 关键修复点：
+  1. RestartSec 30->2, StartLimitIntervalSec=0 (允许无限重启)
+  2. 看门狗 systemd timer 替代 cron (VM 无 crontab)
+  3. 去掉 v2.x 不支持的 flag
+- 关键文件：
+  * 本地脚本: /home/z/my-project/scripts/freestyle-nezha-stabilize.sh (含 v0.x flag, 不适用 v2.x, 留作历史记录)
+  * VM 内: /etc/systemd/system/nezha-agent.service (新版)
+  * VM 内: /usr/local/bin/nezha-watchdog.sh
+  * VM 内: /etc/systemd/system/nezha-watchdog.{service,timer}
+  * VM 内: /opt/nezha/agent/config.yml (保留 disable_auto_update=true, uuid 固定)
+
+环境变量备忘:
+- FREESTYLE_API_KEY=7b5Bky76gGmu2hWudttYxv-6LLGKDSsVgTmunjqaJUQ1zqBDienvKxvqVJRv8z6wm7k
+- VM ID: vfpn0u2l1wz94fuc3j2u
+- 哪吒面板: nz.zxydk1715.dpdns.org:443
+- client_secret: BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL
+
+---
+Task ID: freestyle-web-restore-and-keepalive-verify
+Agent: main (Super Z)
+Task: 恢复 freestyle VM web 服务 + 确认 Encore 保活仓库已含 freestyle 域名
+
+Work Log:
+- 检查 Encore 保活仓库 zx1447/nezha-keepalive-2:
+  * 文件: keepalive/keepalive.ts
+  * TARGETS 数组已包含 "https://freestyle.zxyalist.dpdns.org/api/v1/status"
+  * setInterval 每 5 分钟 ping 所有 TARGETS
+  * 暴露 GET /ping API 手动触发
+- 检查 freestyle VM 内文件:
+  * /root/server.py 在 (GreenLeaf Charity server, 端口 4567)
+  * /root/index.html 在 (GreenLeaf 首页)
+  * 但 server.py 没在跑,外网访问返回 freestyle 默认 "Reloading..." 页
+- 部署 greenleaf-web.service (systemd):
+  * ExecStart=/usr/bin/python3 /root/server.py
+  * Restart=always, RestartSec=2
+  * enabled + active
+- 外网验证:
+  * https://freestyle.zxyalist.dpdns.org/ -> HTTP 200, <title>绿叶公益 | GreenLeaf Charity</title>
+  * https://freestyle.zxyalist.dpdns.org/api/v1/status -> HTTP 200, {"status":"online","service":"GreenLeaf Charity",...}
+- Encore app URL 状态:
+  * staging-nezha-keepalive-2-tp32.encr.app/ping -> 无响应
+  * 其他 keepalive-2 候选 URL -> "Encore application not found"
+  * 推测: keepalive-2 这个 Encore app 可能已下线/scale-to-zero 后没唤起
+  * TARGETS 里也没有 keepalive-2 自己的 URL (保活不自举)
+
+Stage Summary:
+- freestyle VM web 服务恢复完成 (greenleaf-web.service)
+- freestyle 域名已存在于 nezha-keepalive-2 保活列表,无需修改代码
+- 但 keepalive-2 app 本身可能已下线,需要用户去 console.encore.dev 重新部署
+- 关键文件:
+  * 保活源码: /home/z/my-project/nezha-keepalive-2/keepalive/keepalive.ts
+  * VM 内 systemd: /etc/systemd/system/greenleaf-web.service
+- freestyle VM 现在跑两个 systemd 服务: nezha-agent + greenleaf-web
